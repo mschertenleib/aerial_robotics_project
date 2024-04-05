@@ -1,8 +1,7 @@
 # Examples of basic methods for simulation competition
-import numpy as np
-import matplotlib.pyplot as plt
 import cv2
-
+import matplotlib.pyplot as plt
+import numpy as np
 
 """
 All available ground truth measurements can be accessed by calling sensor_data[item], where "item" can take the following values:
@@ -63,7 +62,7 @@ def get_command(sensor_data, camera_data, dt):
     
     control_command = [0.0, 0.0, height_desired, 1.0]
     on_ground = False
-    map = update_occupancy_grid(sensor_data)
+    map = update_occupancy_map(sensor_data)
     
     return control_command # [vx, vy, alt, yaw_rate]
 
@@ -77,59 +76,56 @@ MAP_SIZE_Y = int((MAP_Y_MAX - MAP_Y_MIN) / MAP_RESOLUTION)
 SENSOR_RANGE_MAX = 2.0
 CONFIDENCE = 0.2 # Certainty given by each measurement
 
-def global_to_map(x: float, y: float) -> tuple[int, int]:
-    return (int((x - MAP_X_MIN) / MAP_RESOLUTION),
-            int((y - MAP_Y_MIN) / MAP_RESOLUTION))
+def global_x_to_map(x: float) -> int:
+    return int((x - MAP_X_MIN) / MAP_RESOLUTION)
+
+def global_y_to_map(y: float) -> int:
+    return int((y - MAP_Y_MIN) / MAP_RESOLUTION)
+
+def is_index_x_valid(index: int) -> bool:
+    return index >= 0 and index < MAP_SIZE_X
+
+def is_index_y_valid(index: int) -> bool:
+    return index >= 0 and index < MAP_SIZE_Y
 
 # 0 = unknown, 1 = free, -1 = occupied
-occupancy_grid = np.zeros((MAP_SIZE_Y, MAP_SIZE_X), dtype=np.float32)
+occupancy_map = np.zeros((MAP_SIZE_Y, MAP_SIZE_X), dtype=np.float32)
 
 t = 0 # Current timestep
 
 cv2.namedWindow("map", cv2.WINDOW_NORMAL)
 cv2.resizeWindow("map", 500, 300)
 
-def update_occupancy_grid(sensor_data):
-    global occupancy_grid, t
+def update_occupancy_map(sensor_data):
+    global occupancy_map, t
 
     x_global = sensor_data['x_global']
     y_global = sensor_data['y_global']
     yaw = sensor_data['yaw']
     
-    # Measurements to add to the occupancy grid
-    measurement_grid = np.zeros_like(occupancy_grid)
-
-    line_start = global_to_map(x_global, y_global)
-
-    print(sensor_data['range_front'], sensor_data['range_left'], sensor_data['range_back'], sensor_data['range_right'])
-
     for j in range(4):
         yaw_sensor = yaw + j * np.pi * 0.5
         sensor = ['range_front', 'range_left', 'range_back', 'range_right'][j]
         measurement = sensor_data[sensor]
 
-        x_end_global = x_global + measurement * np.cos(yaw_sensor)
-        y_end_global = y_global + measurement * np.sin(yaw_sensor)
-        line_end = global_to_map(x_end_global, y_end_global)
+        for i in range(int(SENSOR_RANGE_MAX / MAP_RESOLUTION)):
+            distance = i * MAP_RESOLUTION
+            index_x = global_x_to_map(x_global + distance * np.cos(yaw_sensor))
+            index_y = global_y_to_map(y_global + distance * np.sin(yaw_sensor))
 
-        print(MAP_SIZE_X, MAP_SIZE_Y)
-        print(line_start)
-        print(line_end)
-        exit()
+            if distance < measurement:
+                if is_index_x_valid(index_x) and is_index_y_valid(index_y):
+                    occupancy_map[index_y, index_x] += CONFIDENCE
+            else:
+                if is_index_x_valid(index_x) and is_index_y_valid(index_y):
+                    occupancy_map[index_y, index_x] -= CONFIDENCE
+                break
         
-        # Increase the confidence on the whole line, end-point included
-        cv2.line(measurement_grid, line_start, line_end, color=CONFIDENCE)
-        # Decrease twice the confidence on the end-point
-        measurement_grid[line_end[1], line_end[0]] -= 2 * CONFIDENCE
-
-    # The point at the drone location wrongly has 4x confidence
-    measurement_grid[line_start[1], line_start[0]] -= 3 * CONFIDENCE
-
-    occupancy_grid = np.clip(occupancy_grid + measurement_grid, -1.0, 1.0)
+    occupancy_map = np.clip(occupancy_map, -1.0, 1.0)
 
     # only plot every Nth time step (comment out if not needed)
     if t % 10 == 0:
-        map_gray = np.array(np.clip((occupancy_grid + 1.0) * 0.5 * 255.0, 0.0, 255.0), dtype=np.uint8)
+        map_gray = np.array(np.clip((occupancy_map + 1.0) * 0.5 * 255.0, 0.0, 255.0), dtype=np.uint8)
         map_gray = np.flip(map_gray, axis=0)
         cv2.imshow("map", map_gray)
         cv2.waitKey(1)
@@ -191,3 +187,4 @@ def clip_angle(angle):
     elif angle < -np.pi:
         angle += 2.0 * np.pi
     return angle
+
