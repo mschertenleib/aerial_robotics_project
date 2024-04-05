@@ -31,6 +31,15 @@ All available ground truth measurements can be accessed by calling sensor_data[i
 "rate_yaw": Yaw rate (rad/s)
 """
 
+# All lengths are in meters
+MAP_X_MIN, MAP_X_MAX = 0.0, 5.0
+MAP_Y_MIN, MAP_Y_MAX = 0.0, 3.0
+MAP_RESOLUTION = 0.05
+MAP_SIZE_X = int((MAP_X_MAX - MAP_X_MIN) / MAP_RESOLUTION)
+MAP_SIZE_Y = int((MAP_Y_MAX - MAP_Y_MIN) / MAP_RESOLUTION)
+SENSOR_RANGE_MAX = 2.0
+CONFIDENCE = 0.2
+
 
 # Global variables
 on_ground = True
@@ -38,11 +47,12 @@ height_desired = 1.0
 timer = None
 start_pos = None
 timer_done = None
+t = 0
 
 
 # This is the main function where you will implement your control algorithm
 def get_command(sensor_data, camera_data, dt):
-    global on_ground, start_pos
+    global on_ground, start_pos, t
 
     # Open a window to display the camera image
     # NOTE: Displaying the camera image will slow down the simulation, this is just for testing
@@ -60,21 +70,21 @@ def get_command(sensor_data, camera_data, dt):
 
     # ---- YOUR CODE HERE ----
     
-    control_command = [0.0, 0.0, height_desired, 1.0]
+    control_command = [0.0, 0.0, height_desired, 0.0]
     on_ground = False
-    map = update_occupancy_map(sensor_data)
-    
+    occupancy_map = update_occupancy_map(sensor_data)
+
+    if t % 10 == 0:
+        map_image = np.array(np.clip((occupancy_map + 1.0) * 0.5 * 255.0, 0.0, 255.0), dtype=np.uint8)
+        map_image = cv2.cvtColor(map_image, cv2.COLOR_GRAY2BGR)
+        map_image[np.nonzero(occupancy_map <= -0.4)] = (0, 0, 255)
+        map_image = np.flip(map_image, axis=0)
+        cv2.imshow("map", map_image)
+        cv2.waitKey(1)
+    t += 1
+   
     return control_command # [vx, vy, alt, yaw_rate]
 
-
-# All lengths are in meters
-MAP_X_MIN, MAP_X_MAX = 0.0, 5.0
-MAP_Y_MIN, MAP_Y_MAX = 0.0, 3.0
-MAP_RESOLUTION = 0.05
-MAP_SIZE_X = int((MAP_X_MAX - MAP_X_MIN) / MAP_RESOLUTION)
-MAP_SIZE_Y = int((MAP_Y_MAX - MAP_Y_MIN) / MAP_RESOLUTION)
-SENSOR_RANGE_MAX = 2.0
-CONFIDENCE = 0.2 # Certainty given by each measurement
 
 def global_x_to_map(x: float) -> int:
     return int((x - MAP_X_MIN) / MAP_RESOLUTION)
@@ -91,13 +101,12 @@ def is_index_y_valid(index: int) -> bool:
 # 0 = unknown, 1 = free, -1 = occupied
 occupancy_map = np.zeros((MAP_SIZE_Y, MAP_SIZE_X), dtype=np.float32)
 
-t = 0 # Current timestep
 
 cv2.namedWindow("map", cv2.WINDOW_NORMAL)
 cv2.resizeWindow("map", 500, 300)
 
 def update_occupancy_map(sensor_data):
-    global occupancy_map, t
+    global occupancy_map
 
     x_global = sensor_data['x_global']
     y_global = sensor_data['y_global']
@@ -105,7 +114,7 @@ def update_occupancy_map(sensor_data):
     
     for j in range(4):
         yaw_sensor = yaw + j * np.pi * 0.5
-        sensor = ['range_front', 'range_left', 'range_back', 'range_right'][j]
+        sensor = 'range_' + ['front', 'left', 'back', 'right'][j]
         measurement = sensor_data[sensor]
 
         for i in range(int(SENSOR_RANGE_MAX / MAP_RESOLUTION)):
@@ -123,15 +132,7 @@ def update_occupancy_map(sensor_data):
         
     occupancy_map = np.clip(occupancy_map, -1.0, 1.0)
 
-    # only plot every Nth time step (comment out if not needed)
-    if t % 10 == 0:
-        map_gray = np.array(np.clip((occupancy_map + 1.0) * 0.5 * 255.0, 0.0, 255.0), dtype=np.uint8)
-        map_gray = np.flip(map_gray, axis=0)
-        cv2.imshow("map", map_gray)
-        cv2.waitKey(1)
-    t += 1
-
-    return map
+    return occupancy_map
 
 
 # Control from the exercises
