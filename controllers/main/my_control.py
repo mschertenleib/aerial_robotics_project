@@ -102,18 +102,39 @@ def get_velocity_command(sensor_data, occupancy_map, target) -> np.ndarray:
     vel_attractive = attraction(pos_global, target)
     vel_repulsive = repulsion(pos_global, np.flip(obstacles, axis=1))
     vel = np.clip((vel_attractive + vel_repulsive).squeeze(), -0.5, 0.5)
-    print(vel_attractive, vel_repulsive, vel)
     return vel
 
 def attraction(pos: np.ndarray, target: np.ndarray) -> np.ndarray:
+    ATTENUATION_RADIUS = 0.2
+    EPSILON = 0.001
+    NOMINAL_VELOCITY = 1.0
     target_rel = target - pos
-    return np.clip(target_rel, -0.5, 0.5)
+    distance = np.linalg.norm(target_rel)
+    if distance >= ATTENUATION_RADIUS:
+        return NOMINAL_VELOCITY * target_rel / distance
+    elif distance >= EPSILON:
+        return NOMINAL_VELOCITY * target_rel / ATTENUATION_RADIUS
+    else:
+        return np.zeros_like(target_rel)
 
 def repulsion(pos: np.ndarray, obstacles: np.ndarray) -> np.ndarray:
+    # 1/r repulsion:
+    #  v = A*(r0-r)/(r-a)
+    #  -A*r0/a = A0     A = -A0*a/r0
+    #  v = A0/r0*a*(r-r0)/(r-a)    more "curvy" with `a` being a small negative value
+    #
+    # linear repulsion:
+    #  v = v0/r0*(r0-r)
+    #
+    REPULSION_STRENGTH = 0.5
+    INFLUENCE_RADIUS = 0.4
+    EPSILON = 0.001
     obstacles_rel = obstacles - pos.reshape((1, 2))
-    REPULSION_STRENGTH = 0.03  # [m*m/s]
-    distances_sq = np.sum(obstacles_rel * obstacles_rel, axis=1).reshape((-1, 1))
-    repulsives = -REPULSION_STRENGTH / distances_sq * obstacles_rel
+    distances = np.linalg.norm(obstacles_rel, axis=1)  #.reshape((-1, 1))
+    close_indices = (distances >= EPSILON) & (distances < INFLUENCE_RADIUS)
+    close_distances = distances[close_indices].reshape((-1, 1))
+    close_obstacles = obstacles_rel[close_indices, :]
+    repulsives = REPULSION_STRENGTH / INFLUENCE_RADIUS * (close_distances - INFLUENCE_RADIUS) * close_obstacles / close_distances
     return np.sum(repulsives, axis=0)
 
 def x_global_to_map(x: float) -> int:
