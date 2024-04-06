@@ -71,13 +71,37 @@ def get_command(sensor_data, camera_data, dt):
     # ---- YOUR CODE HERE ----
     
     control_command = [0.0, 0.0, height_desired, 0.0]
-    on_ground = False
+    target = np.array([4.8, 1.5])
+
+    # FIXME: it is absolutely necessary to define a region of influence 
+    # for repulsive forces
+
     occupancy_map = update_occupancy_map(sensor_data)
+    # In (y, x) map indices
+    obstacles = np.argwhere(occupancy_map <= -0.2)
+    # In (y, x) global frame
+    obstacles = obstacles.astype(np.float32) * MAP_RESOLUTION + np.array([MAP_Y_MIN, MAP_X_MIN])
+    pos_global = np.array([sensor_data['x_global'], sensor_data['y_global']])
+    # In (x, y) global frame
+    obstacles_rel = np.flip(obstacles, axis=1) - pos_global.reshape((1, 2))
+    target_rel = target - pos_global
+    vel_attractive = np.clip(target_rel, -0.5, 0.5)
+    REPULSION_STRENGTH = 0.03  # [m*m/s]
+    distances_sq = np.sum(obstacles_rel * obstacles_rel, axis=1).reshape((-1, 1))
+    repulsives = -REPULSION_STRENGTH / distances_sq * obstacles_rel
+    vel_repulsive = np.sum(repulsives, axis=0)
+    vel = np.clip((vel_attractive + vel_repulsive).squeeze(), -0.5, 0.5)
+    print(vel_attractive, vel_repulsive, vel)
+    control_command[:2] = vel
 
     if t % 10 == 0:
         map_image = np.array(np.clip((occupancy_map + 1.0) * 0.5 * 255.0, 0.0, 255.0), dtype=np.uint8)
         map_image = cv2.cvtColor(map_image, cv2.COLOR_GRAY2BGR)
-        map_image[np.nonzero(occupancy_map <= -0.4)] = (0, 0, 255)
+        x_map = x_global_to_map(pos_global[0])
+        y_map = y_global_to_map(pos_global[1])
+        if is_index_x_valid(x_map) and is_index_y_valid(y_map):
+            map_image[y_map, x_map] = (255, 0, 0)
+        map_image[np.nonzero(occupancy_map <= -0.2)] = (0, 0, 255)
         map_image = np.flip(map_image, axis=0)
         cv2.imshow("map", map_image)
         cv2.waitKey(1)
@@ -86,11 +110,17 @@ def get_command(sensor_data, camera_data, dt):
     return control_command # [vx, vy, alt, yaw_rate]
 
 
-def global_x_to_map(x: float) -> int:
+def x_global_to_map(x: float) -> int:
     return int((x - MAP_X_MIN) / MAP_RESOLUTION)
 
-def global_y_to_map(y: float) -> int:
+def y_global_to_map(y: float) -> int:
     return int((y - MAP_Y_MIN) / MAP_RESOLUTION)
+
+def x_map_to_global(x: int) -> float:
+    return x * MAP_RESOLUTION + MAP_X_MIN
+
+def y_map_to_global(y: int) -> float:
+    return y * MAP_RESOLUTION + MAP_Y_MIN
 
 def is_index_x_valid(index: int) -> bool:
     return index >= 0 and index < MAP_SIZE_X
@@ -117,10 +147,13 @@ def update_occupancy_map(sensor_data):
         sensor = 'range_' + ['front', 'left', 'back', 'right'][j]
         measurement = sensor_data[sensor]
 
+        # FIXME: right now we always have an error of up to 2*MAP_RESOLUTION
+        # because of the various roundings, and the fact that a map cell
+        # coordinate indicates its corner, not its center
         for i in range(int(SENSOR_RANGE_MAX / MAP_RESOLUTION)):
             distance = i * MAP_RESOLUTION
-            index_x = global_x_to_map(x_global + distance * np.cos(yaw_sensor))
-            index_y = global_y_to_map(y_global + distance * np.sin(yaw_sensor))
+            index_x = x_global_to_map(x_global + distance * np.cos(yaw_sensor))
+            index_y = y_global_to_map(y_global + distance * np.sin(yaw_sensor))
 
             if distance < measurement:
                 if is_index_x_valid(index_x) and is_index_y_valid(index_y):
@@ -135,7 +168,8 @@ def update_occupancy_map(sensor_data):
     return occupancy_map
 
 
-# Control from the exercises
+# --- Control from the exercises ---
+
 index_current_setpoint = 0
 def path_to_setpoint(path,sensor_data,dt):
     global on_ground, height_desired, index_current_setpoint, timer, timer_done, start_pos
