@@ -73,32 +73,15 @@ def get_command(sensor_data, camera_data, dt):
     control_command = [0.0, 0.0, height_desired, 0.0]
     target = np.array([4.8, 1.5])
 
-    # FIXME: it is absolutely necessary to define a region of influence 
-    # for repulsive forces
-
     occupancy_map = update_occupancy_map(sensor_data)
-    # In (y, x) map indices
-    obstacles = np.argwhere(occupancy_map <= -0.2)
-    # In (y, x) global frame
-    obstacles = obstacles.astype(np.float32) * MAP_RESOLUTION + np.array([MAP_Y_MIN, MAP_X_MIN])
-    pos_global = np.array([sensor_data['x_global'], sensor_data['y_global']])
-    # In (x, y) global frame
-    obstacles_rel = np.flip(obstacles, axis=1) - pos_global.reshape((1, 2))
-    target_rel = target - pos_global
-    vel_attractive = np.clip(target_rel, -0.5, 0.5)
-    REPULSION_STRENGTH = 0.03  # [m*m/s]
-    distances_sq = np.sum(obstacles_rel * obstacles_rel, axis=1).reshape((-1, 1))
-    repulsives = -REPULSION_STRENGTH / distances_sq * obstacles_rel
-    vel_repulsive = np.sum(repulsives, axis=0)
-    vel = np.clip((vel_attractive + vel_repulsive).squeeze(), -0.5, 0.5)
-    print(vel_attractive, vel_repulsive, vel)
+    vel = get_velocity_command(sensor_data, occupancy_map, target)
     control_command[:2] = vel
 
     if t % 10 == 0:
         map_image = np.array(np.clip((occupancy_map + 1.0) * 0.5 * 255.0, 0.0, 255.0), dtype=np.uint8)
         map_image = cv2.cvtColor(map_image, cv2.COLOR_GRAY2BGR)
-        x_map = x_global_to_map(pos_global[0])
-        y_map = y_global_to_map(pos_global[1])
+        x_map = x_global_to_map(sensor_data['x_global'])
+        y_map = y_global_to_map(sensor_data['y_global'])
         if is_index_x_valid(x_map) and is_index_y_valid(y_map):
             map_image[y_map, x_map] = (255, 0, 0)
         map_image[np.nonzero(occupancy_map <= -0.2)] = (0, 0, 255)
@@ -109,6 +92,29 @@ def get_command(sensor_data, camera_data, dt):
    
     return control_command # [vx, vy, alt, yaw_rate]
 
+def get_velocity_command(sensor_data, occupancy_map, target) -> np.ndarray:
+    # In (y, x) map indices
+    obstacles = np.argwhere(occupancy_map <= -0.2)
+    # In (y, x) global frame
+    obstacles = obstacles.astype(np.float32) * MAP_RESOLUTION + np.array([MAP_Y_MIN, MAP_X_MIN])
+    pos_global = np.array([sensor_data['x_global'], sensor_data['y_global']])
+    # In (x, y) global frame
+    vel_attractive = attraction(pos_global, target)
+    vel_repulsive = repulsion(pos_global, np.flip(obstacles, axis=1))
+    vel = np.clip((vel_attractive + vel_repulsive).squeeze(), -0.5, 0.5)
+    print(vel_attractive, vel_repulsive, vel)
+    return vel
+
+def attraction(pos: np.ndarray, target: np.ndarray) -> np.ndarray:
+    target_rel = target - pos
+    return np.clip(target_rel, -0.5, 0.5)
+
+def repulsion(pos: np.ndarray, obstacles: np.ndarray) -> np.ndarray:
+    obstacles_rel = obstacles - pos.reshape((1, 2))
+    REPULSION_STRENGTH = 0.03  # [m*m/s]
+    distances_sq = np.sum(obstacles_rel * obstacles_rel, axis=1).reshape((-1, 1))
+    repulsives = -REPULSION_STRENGTH / distances_sq * obstacles_rel
+    return np.sum(repulsives, axis=0)
 
 def x_global_to_map(x: float) -> int:
     return int((x - MAP_X_MIN) / MAP_RESOLUTION)
