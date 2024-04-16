@@ -26,6 +26,9 @@ MAP_SIZE_Y = int((MAP_Y_MAX - MAP_Y_MIN) / MAP_RESOLUTION)
 
 CONFIDENCE = 0.2
 
+IMG_RESOLUTION = 0.01
+IMG_SIZE_X = int((MAP_X_MAX - MAP_X_MIN) / IMG_RESOLUTION)
+IMG_SIZE_Y = int((MAP_Y_MAX - MAP_Y_MIN) / IMG_RESOLUTION)
 
 # Global variables
 on_ground = True
@@ -39,7 +42,7 @@ t = 0
 occupancy_map = np.zeros((MAP_SIZE_Y, MAP_SIZE_X), dtype=np.float32)
 
 cv2.namedWindow("map", cv2.WINDOW_NORMAL)
-cv2.resizeWindow("map", 500, 300)
+cv2.resizeWindow("map", IMG_SIZE_X, IMG_SIZE_Y)
 
 
 # This is the main function where you will implement your control algorithm
@@ -76,21 +79,51 @@ def get_command(sensor_data, camera_data, dt):
     control_command[:2] = vel_frame
 
     if t % 10 == 0:
-        map_image = np.array(
-            np.clip((occupancy_map + 1.0) * 0.5 * 255.0, 0.0, 255.0), dtype=np.uint8
-        )
-        map_image = cv2.cvtColor(map_image, cv2.COLOR_GRAY2BGR)
-        x_map = x_global_to_map(sensor_data["x_global"])
-        y_map = y_global_to_map(sensor_data["y_global"])
-        if is_index_x_valid(x_map) and is_index_y_valid(y_map):
-            map_image[y_map, x_map] = (255, 0, 0)
-        map_image = np.flip(map_image, axis=0)
+        map_image = create_image(occupancy_map, sensor_data)
         cv2.imshow("map", map_image)
         cv2.waitKey(1)
     t += 1
 
     # Ordered as array with: [v_forward_cmd, v_left_cmd, alt_cmd, yaw_rate_cmd]
     return control_command
+
+
+def create_image(occupancy_map: np.ndarray, sensor_data: dict) -> np.ndarray:
+    map_grayscale = np.clip((occupancy_map + 1.0) * 0.5 * 255.0, 0.0, 255.0).astype(
+        np.uint8
+    )
+    img = cv2.cvtColor(
+        cv2.resize(
+            map_grayscale,
+            dsize=(IMG_SIZE_X, IMG_SIZE_Y),
+            interpolation=cv2.INTER_NEAREST,
+        ),
+        cv2.COLOR_GRAY2BGR,
+    )
+
+    pos_global = np.array([sensor_data["x_global"], sensor_data["y_global"]])
+    yaw = sensor_data["yaw"]
+    pos_to_tip = np.array([np.cos(yaw), np.sin(yaw)]) * 0.08
+    tip_global = pos_global + pos_to_tip
+    pos_to_left = np.array([pos_to_tip[1], -pos_to_tip[0]]) * 0.3
+    left_global = pos_global + pos_to_left
+    right_global = pos_global - pos_to_left
+    pts = global_to_img(
+        [
+            tip_global,
+            left_global,
+            right_global,
+        ]
+    )
+    cv2.polylines(
+        img,
+        pts=[pts.reshape((-1, 1, 2))],
+        isClosed=True,
+        color=(0, 0, 255),
+        thickness=2,
+    )
+
+    return np.flip(img, axis=0)
 
 
 def get_velocity_command(sensor_data, occupancy_map, target) -> np.ndarray:
@@ -170,12 +203,36 @@ def map_to_global(coords: np.ndarray) -> np.ndarray:
     ).reshape((1, 2))
 
 
-def is_index_x_valid(index: int) -> bool:
+def x_global_to_img(x: float) -> int:
+    return int(np.floor((x - MAP_X_MIN) / IMG_RESOLUTION))
+
+
+def y_global_to_img(y: float) -> int:
+    return int(np.floor((y - MAP_Y_MIN) / IMG_RESOLUTION))
+
+
+def global_to_img(pts: np.ndarray) -> np.ndarray:
+    return (
+        np.floor(
+            (pts - np.array([MAP_Y_MIN, MAP_X_MIN]).reshape((1, 2))) / IMG_RESOLUTION
+        )
+    ).astype(np.int32)
+
+
+def is_map_x_valid(index: int) -> bool:
     return index >= 0 and index < MAP_SIZE_X
 
 
-def is_index_y_valid(index: int) -> bool:
+def is_map_y_valid(index: int) -> bool:
     return index >= 0 and index < MAP_SIZE_Y
+
+
+def is_img_x_valid(index: int) -> bool:
+    return index >= 0 and index < IMG_SIZE_X
+
+
+def is_img_y_valid(index: int) -> bool:
+    return index >= 0 and index < IMG_SIZE_Y
 
 
 def update_occupancy_map(sensor_data):
@@ -196,10 +253,10 @@ def update_occupancy_map(sensor_data):
             index_y = y_global_to_map(y_global + distance * np.sin(yaw_sensor))
 
             if distance < measurement:
-                if is_index_x_valid(index_x) and is_index_y_valid(index_y):
+                if is_map_x_valid(index_x) and is_map_y_valid(index_y):
                     occupancy_map[index_y, index_x] += CONFIDENCE
             else:
-                if is_index_x_valid(index_x) and is_index_y_valid(index_y):
+                if is_map_x_valid(index_x) and is_map_y_valid(index_y):
                     occupancy_map[index_y, index_x] -= CONFIDENCE
                 break
 
@@ -282,5 +339,9 @@ def clip_angle(angle):
         angle += 2.0 * np.pi
     return angle
 
+
 def rotate(vec: np.ndarray, angle: float) -> np.ndarray:
-    return np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]]) @ vec
+    return (
+        np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+        @ vec
+    )
