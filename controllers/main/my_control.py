@@ -74,9 +74,10 @@ def get_command(sensor_data, camera_data, dt):
 
     occupancy_map = update_occupancy_map(sensor_data)
     # Velocity command in world frame
-    vel = get_velocity_command(sensor_data, occupancy_map, target)
-    vel_frame = rotate(vel, -sensor_data["yaw"])
-    control_command[:2] = vel_frame
+    vel_world = get_velocity_command(sensor_data, occupancy_map, target)
+    # Velocity command in local frame
+    vel_local = rotate(vel_world, -sensor_data["yaw"])
+    control_command[:2] = vel_local
 
     if t % 10 == 0:
         map_image = create_image(occupancy_map, sensor_data)
@@ -109,11 +110,13 @@ def create_image(occupancy_map: np.ndarray, sensor_data: dict) -> np.ndarray:
     left_global = pos_global + pos_to_left
     right_global = pos_global - pos_to_left
     pts = global_to_img(
-        [
-            tip_global,
-            left_global,
-            right_global,
-        ]
+        np.array(
+            [
+                tip_global,
+                left_global,
+                right_global,
+            ]
+        )
     )
     cv2.polylines(
         img,
@@ -129,12 +132,12 @@ def create_image(occupancy_map: np.ndarray, sensor_data: dict) -> np.ndarray:
 def get_velocity_command(sensor_data, occupancy_map, target) -> np.ndarray:
     # In (y, x) map indices
     obstacles = np.argwhere(occupancy_map <= -0.2)
-    # In (y, x) global frame
+    # In (x, y) global frame
     obstacles = map_to_global(obstacles)
     pos_global = np.array([sensor_data["x_global"], sensor_data["y_global"]])
     # In (x, y) global frame
     vel_attractive = attraction(pos_global, target)
-    vel_repulsive = repulsion(pos_global, np.flip(obstacles, axis=1))
+    vel_repulsive = repulsion(pos_global, obstacles)
     vel = np.clip((vel_attractive + vel_repulsive).squeeze(), -0.3, 0.3)
     return vel
 
@@ -163,6 +166,8 @@ def repulsion(pos: np.ndarray, obstacles: np.ndarray) -> np.ndarray:
     #  v = v0/r0*(r0-r)
     #
     # FIXME: try to understand why it is unstable when obstacles appear suddenly
+    # FIXME: we need to add repulsive walls !!
+    # FIXME: implement local minima avoidance from paper
     REPULSION_STRENGTH = 0.2
     INFLUENCE_RADIUS = 0.4
     EPSILON = 0.001
@@ -181,83 +186,73 @@ def repulsion(pos: np.ndarray, obstacles: np.ndarray) -> np.ndarray:
     return np.sum(repulsives, axis=0)
 
 
-def x_global_to_map(x: float) -> int:
-    return int(np.floor((x - MAP_X_MIN) / MAP_RESOLUTION))
+def map_to_global(indices: np.ndarray) -> np.ndarray:
+    """
+    (Y, X) map frame -> (X, Y) global frame
+    """
+    offset = np.array([MAP_Y_MIN, MAP_X_MIN]).reshape((1, 2))
+    return np.flip(
+        (indices.reshape((-1, 2)).astype(np.float32) + 0.5) * MAP_RESOLUTION + offset,
+        axis=1,
+    ).reshape(indices.shape)
 
 
-def y_global_to_map(y: float) -> int:
-    return int(np.floor((y - MAP_Y_MIN) / MAP_RESOLUTION))
-
-
-def x_map_to_global(x: int) -> float:
-    return (float(x) + 0.5) * MAP_RESOLUTION + MAP_X_MIN
-
-
-def y_map_to_global(y: int) -> float:
-    return (float(y) + 0.5) * MAP_RESOLUTION + MAP_Y_MIN
-
-
-def map_to_global(coords: np.ndarray) -> np.ndarray:
-    return (coords.astype(np.float32) + 0.5) * MAP_RESOLUTION + np.array(
-        [MAP_Y_MIN, MAP_X_MIN]
-    ).reshape((1, 2))
-
-
-def x_global_to_img(x: float) -> int:
-    return int(np.floor((x - MAP_X_MIN) / IMG_RESOLUTION))
-
-
-def y_global_to_img(y: float) -> int:
-    return int(np.floor((y - MAP_Y_MIN) / IMG_RESOLUTION))
+def global_to_map(pts: np.ndarray) -> np.ndarray:
+    """
+    (X, Y) global frame -> (Y, X) map frame
+    """
+    offset = np.array([MAP_Y_MIN, MAP_X_MIN]).reshape((1, 2))
+    return (
+        (np.floor((np.flip(pts.reshape((-1, 2)), axis=1) - offset) / MAP_RESOLUTION))
+        .astype(np.int32)
+        .reshape((pts.shape))
+    )
 
 
 def global_to_img(pts: np.ndarray) -> np.ndarray:
+    """
+    (X, Y) global frame -> (X, Y) image frame
+    """
+    offset = np.array([MAP_Y_MIN, MAP_X_MIN]).reshape((1, 2))
     return (
-        np.floor(
-            (pts - np.array([MAP_Y_MIN, MAP_X_MIN]).reshape((1, 2))) / IMG_RESOLUTION
-        )
-    ).astype(np.int32)
+        (np.floor((pts.reshape((-1, 2)) - offset) / IMG_RESOLUTION))
+        .astype(np.int32)
+        .reshape(pts.shape)
+    )
 
 
-def is_map_x_valid(index: int) -> bool:
-    return index >= 0 and index < MAP_SIZE_X
+def is_index_valid_map(row: int, col: int) -> bool:
+    return (row >= 0) and (row < MAP_SIZE_Y) and (col >= 0) and (col < MAP_SIZE_X)
 
 
-def is_map_y_valid(index: int) -> bool:
-    return index >= 0 and index < MAP_SIZE_Y
+def is_index_valid_img(row: int, col: int) -> bool:
+    return (row >= 0) and (row < IMG_SIZE_Y) and (col >= 0) and (col < IMG_SIZE_X)
 
 
-def is_img_x_valid(index: int) -> bool:
-    return index >= 0 and index < IMG_SIZE_X
-
-
-def is_img_y_valid(index: int) -> bool:
-    return index >= 0 and index < IMG_SIZE_Y
-
-
-def update_occupancy_map(sensor_data):
+def update_occupancy_map(sensor_data: dict) -> np.ndarray:
     global occupancy_map
 
     x_global = sensor_data["x_global"]
     y_global = sensor_data["y_global"]
+    xy_global = np.array([x_global, y_global])
     yaw = sensor_data["yaw"]
 
     for j in range(4):
         yaw_sensor = yaw + j * np.pi * 0.5
+        yaw_direction = np.array([np.cos(yaw_sensor), np.sin(yaw_sensor)])
         sensor = "range_" + ["front", "left", "back", "right"][j]
         measurement = sensor_data[sensor]
 
         for i in range(int(SENSOR_RANGE_MAX / MAP_RESOLUTION)):
             distance = i * MAP_RESOLUTION
-            index_x = x_global_to_map(x_global + distance * np.cos(yaw_sensor))
-            index_y = y_global_to_map(y_global + distance * np.sin(yaw_sensor))
+            index = global_to_map(xy_global + distance * yaw_direction)
 
             if distance < measurement:
-                if is_map_x_valid(index_x) and is_map_y_valid(index_y):
-                    occupancy_map[index_y, index_x] += CONFIDENCE
+                if is_index_valid_map(row=index[0], col=index[1]):
+                    occupancy_map[index[0], index[1]] += CONFIDENCE
             else:
-                if is_map_x_valid(index_x) and is_map_y_valid(index_y):
-                    occupancy_map[index_y, index_x] -= CONFIDENCE
+                if is_index_valid_map(row=index[0], col=index[1]):
+                    occupancy_map[index[0], index[1]] -= CONFIDENCE
                 break
 
     occupancy_map = np.clip(occupancy_map, -1.0, 1.0)
