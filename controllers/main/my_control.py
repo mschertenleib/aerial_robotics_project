@@ -143,47 +143,93 @@ def get_velocity_command(sensor_data, occupancy_map, target) -> np.ndarray:
 
 
 def attraction(pos: np.ndarray, target: np.ndarray) -> np.ndarray:
-    ATTENUATION_RADIUS = 0.2
-    EPSILON = 0.001
-    NOMINAL_VELOCITY = 0.3
+    """
+    Generates an attractive velocity to the target.
+    The velocity profile is linear near the target and constant further away:
+        ||v(r)|| = v0 * r / r0    if r < r0
+        ||v(r)|| = v0             if r >= r0
+
+    Arguments:
+        pos: (2,) position of the drone in world space
+        target: (2,) position of the target in world space
+    """
+
+    ATTENUATION_RADIUS = 0.2  # r0 [m/s]
+    MAX_ATTRACTION_VELOCITY = 0.3  # v0 [m/s]
+    EPSILON = 0.001  # [m]
+
     target_rel = target - pos
     distance = np.linalg.norm(target_rel)
     if distance >= ATTENUATION_RADIUS:
-        return NOMINAL_VELOCITY * target_rel / distance
+        return MAX_ATTRACTION_VELOCITY * target_rel / distance
     elif distance >= EPSILON:
-        return NOMINAL_VELOCITY * target_rel / ATTENUATION_RADIUS
+        return MAX_ATTRACTION_VELOCITY * target_rel / ATTENUATION_RADIUS
     else:
         return np.zeros_like(target_rel)
 
 
 def repulsion(pos: np.ndarray, obstacles: np.ndarray) -> np.ndarray:
-    # 1/r repulsion:
-    #  v = A*(r0-r)/(r-a)
-    #  -A*r0/a = A0     A = -A0*a/r0
-    #  v = A0/r0*a*(r-r0)/(r-a)    more "curvy" with `a` being a small negative value
-    #
-    # linear repulsion:
-    #  v = v0/r0*(r0-r)
-    #
-    # FIXME: try to understand why it is unstable when obstacles appear suddenly
+    """
+    Generates a repulsive velocity from obstacles and map borders.
+    The velocity profile is linear:
+        ||v(r)|| = v0 / r0 * (r0 - r)    if r < r0
+        ||v(r)|| = 0                     if r >= r0
+
+    Arguments:
+        pos: (2,) position of the drone in world space
+        obstacles: (N, 2) positions of obstacles in world space
+    """
     # FIXME: we need to add repulsive walls !!
     # FIXME: implement local minima avoidance from paper
-    REPULSION_STRENGTH = 0.2
-    INFLUENCE_RADIUS = 0.4
-    EPSILON = 0.001
-    obstacles_rel = obstacles - pos.reshape((1, 2))
-    distances = np.linalg.norm(obstacles_rel, axis=1)  # .reshape((-1, 1))
+    MAX_REPULSION_VELOCITY = 0.2  # v0 [m/s]
+    INFLUENCE_RADIUS = 0.4  # r0 [m]
+    EPSILON = 0.001  # [m]
+
+    obstacles_rel = obstacles.reshape((-1, 2)) - pos.reshape((1, 2))
+    distances = np.linalg.norm(obstacles_rel, axis=1)
     close_indices = (distances >= EPSILON) & (distances < INFLUENCE_RADIUS)
     close_distances = distances[close_indices].reshape((-1, 1))
     close_obstacles = obstacles_rel[close_indices, :]
-    repulsives = (
-        REPULSION_STRENGTH
+    obstacle_repulsions = (
+        MAX_REPULSION_VELOCITY
         / INFLUENCE_RADIUS
         * (close_distances - INFLUENCE_RADIUS)
         * close_obstacles
         / close_distances
     )
-    return np.sum(repulsives, axis=0)
+
+    wall_repulsion_x_min = (
+        MAX_REPULSION_VELOCITY
+        / INFLUENCE_RADIUS
+        * (MAP_X_MIN + INFLUENCE_RADIUS - pos[0])
+    )
+    wall_repulsion_x_max = (
+        -MAX_REPULSION_VELOCITY
+        / INFLUENCE_RADIUS
+        * (MAP_X_MAX + INFLUENCE_RADIUS - pos[0])
+    )
+    wall_repulsion_y_min = (
+        MAX_REPULSION_VELOCITY
+        / INFLUENCE_RADIUS
+        * (MAP_Y_MIN + INFLUENCE_RADIUS - pos[1])
+    )
+    wall_repulsion_y_max = (
+        -MAX_REPULSION_VELOCITY
+        / INFLUENCE_RADIUS
+        * (MAP_Y_MAX + INFLUENCE_RADIUS - pos[1])
+    )
+    # FIXME
+    wall_repulsion = np.array(
+        [
+            [wall_repulsion_x_min, 0.0],
+            [wall_repulsion_x_max, 0.0],
+            [0.0, wall_repulsion_y_min],
+            [0.0, wall_repulsion_y_max],
+            [0.0, 0.0],
+        ]
+    ).max(axis=0)
+
+    return np.sum(obstacle_repulsions, axis=0) + wall_repulsion
 
 
 def map_to_global(indices: np.ndarray) -> np.ndarray:
@@ -223,10 +269,6 @@ def global_to_img(pts: np.ndarray) -> np.ndarray:
 
 def is_index_valid_map(row: int, col: int) -> bool:
     return (row >= 0) and (row < MAP_SIZE_Y) and (col >= 0) and (col < MAP_SIZE_X)
-
-
-def is_index_valid_img(row: int, col: int) -> bool:
-    return (row >= 0) and (row < IMG_SIZE_Y) and (col >= 0) and (col < IMG_SIZE_X)
 
 
 def update_occupancy_map(sensor_data: dict) -> np.ndarray:
