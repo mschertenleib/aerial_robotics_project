@@ -129,7 +129,9 @@ def create_map_image(occupancy_map: np.ndarray, sensor_data: dict) -> np.ndarray
     return np.flip(img, axis=0)
 
 
-def get_velocity_command(sensor_data, occupancy_map, target) -> np.ndarray:
+def get_velocity_command(
+    sensor_data: dict, occupancy_map: np.ndarray, target: np.ndarray
+) -> np.ndarray:
     # In (y, x) map indices
     obstacles = np.argwhere(occupancy_map <= -0.2)
     # In (x, y) global frame
@@ -138,7 +140,9 @@ def get_velocity_command(sensor_data, occupancy_map, target) -> np.ndarray:
     # In (x, y) global frame
     vel_attractive = attraction_to_target(pos_global, target)
     vel_repulsive = repulsion(pos_global, obstacles)
-    vel = clip_norm((vel_attractive + vel_repulsive).squeeze(), max_norm=0.3)
+    vel = clip_norm(
+        (vel_attractive + vel_repulsive).squeeze(), max_norm=0.3, epsilon=0.001
+    )
     return vel
 
 
@@ -150,22 +154,17 @@ def attraction_to_target(pos: np.ndarray, target: np.ndarray) -> np.ndarray:
         ||v(r)|| = v0             if r >= r0
 
     Arguments:
-        pos: (2,) position of the drone in world space
-        target: (2,) position of the target in world space
+        pos: position of the drone in world space
+        target: position of the target in world space
     """
 
     MAX_ATTRACTION_VELOCITY = 0.3  # v0 [m/s]
-    ATTENUATION_RADIUS = 0.2  # r0 [m/s]
-    EPSILON = 0.001  # [m]
-
-    target_rel = target - pos
-    distance = np.linalg.norm(target_rel)
-    if distance >= ATTENUATION_RADIUS:
-        return MAX_ATTRACTION_VELOCITY * target_rel / distance
-    elif distance >= EPSILON:
-        return MAX_ATTRACTION_VELOCITY * target_rel / ATTENUATION_RADIUS
-    else:
-        return np.zeros_like(target_rel)
+    ATTENUATION_RADIUS = 0.2  # r0 [m]
+    return clip_norm(
+        MAX_ATTRACTION_VELOCITY / ATTENUATION_RADIUS * (target - pos),
+        max_norm=MAX_ATTRACTION_VELOCITY,
+        epsilon=0.001,
+    )
 
 
 def repulsion(pos: np.ndarray, obstacles: np.ndarray) -> np.ndarray:
@@ -176,8 +175,8 @@ def repulsion(pos: np.ndarray, obstacles: np.ndarray) -> np.ndarray:
         ||v(r)|| = 0                     if r >= r0
 
     Arguments:
-        pos: (2,) position of the drone in world space
-        obstacles: (N, 2) positions of obstacles in world space
+        pos: position(s) of the drone in world space
+        obstacles: positions of obstacles in world space
     """
     # FIXME: implement local minima avoidance from paper
     MAX_REPULSION_VELOCITY = 0.3  # v0 [m/s]
@@ -185,36 +184,32 @@ def repulsion(pos: np.ndarray, obstacles: np.ndarray) -> np.ndarray:
     EPSILON = 0.001  # [m]
 
     # Repulsion from obstacles
-    obstacles_rel = obstacles.reshape((-1, 2)) - pos.reshape((1, 2))
-    distances = np.linalg.norm(obstacles_rel, axis=1)
-    close_indices = (distances >= EPSILON) & (distances < INFLUENCE_RADIUS)
-    close_distances = distances[close_indices].reshape((-1, 1))
-    close_obstacles = obstacles_rel[close_indices, :]
-    obstacle_repulsions = (
-        MAX_REPULSION_VELOCITY
-        / INFLUENCE_RADIUS
-        * (close_distances - INFLUENCE_RADIUS)
-        * close_obstacles
-        / close_distances
-    )
+    obstacles_rel = obstacles.reshape((-1, 1, 2)) - pos.reshape((1, -1, 2))
+    distances = np.linalg.norm(obstacles_rel, axis=-1, keepdims=1)
+    close_mask = (distances >= EPSILON) & (distances < INFLUENCE_RADIUS)
+    obstacle_repulsion = np.sum(
+        np.where(
+            close_mask,
+            MAX_REPULSION_VELOCITY
+            / INFLUENCE_RADIUS
+            * (distances - INFLUENCE_RADIUS)
+            * obstacles_rel
+            / distances,
+            0.0,
+        ),
+        axis=0,
+    ).squeeze()
 
     # Repulsion from map borders
-    delta_x_min = MAP_X_MIN + INFLUENCE_RADIUS - pos[0]
-    delta_x_max = MAP_X_MAX - INFLUENCE_RADIUS - pos[0]
-    delta_y_min = MAP_Y_MIN + INFLUENCE_RADIUS - pos[1]
-    delta_y_max = MAP_Y_MAX - INFLUENCE_RADIUS - pos[1]
-    wall_repulsion = (
+    delta_min = np.array([MAP_X_MIN, MAP_Y_MIN]) + INFLUENCE_RADIUS - pos
+    delta_max = np.array([MAP_X_MAX, MAP_Y_MAX]) - INFLUENCE_RADIUS - pos
+    border_repulsion = (
         MAX_REPULSION_VELOCITY
         / INFLUENCE_RADIUS
-        * np.array(
-            [
-                max(delta_x_min, 0.0) + min(delta_x_max, 0.0),
-                max(delta_y_min, 0.0) + min(delta_y_max, 0.0),
-            ]
-        )
+        * (np.maximum(delta_min, 0.0) + np.minimum(delta_max, 0.0))
     )
 
-    return np.sum(obstacle_repulsions, axis=0) + wall_repulsion
+    return obstacle_repulsion + border_repulsion
 
 
 def map_to_global(indices: np.ndarray) -> np.ndarray:
@@ -369,9 +364,12 @@ def rotate(vec: np.ndarray, angle: float) -> np.ndarray:
     )
 
 
-def clip_norm(vec: np.ndarray, max_norm: float) -> np.ndarray:
-    norm = np.linalg.norm(vec)
-    if norm > max_norm:
-        return vec * (max_norm / norm)
-    else:
-        return vec
+def clip_norm(
+    vec: np.ndarray, max_norm: float | np.ndarray, epsilon: float = 0.0
+) -> np.ndarray:
+    norm = np.linalg.norm(vec, axis=-1)
+    return np.where(
+        norm > max_norm,
+        vec * (max_norm / norm),
+        np.where(norm > epsilon, vec, 0.0) if epsilon > 0.0 else vec,
+    )
