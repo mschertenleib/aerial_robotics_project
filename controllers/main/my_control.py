@@ -69,18 +69,25 @@ def get_command(sensor_data, camera_data, dt):
 
     # ---- YOUR CODE HERE ----
 
-    control_command = [0.0, 0.0, height_desired, 2.0]
+    # In world frame
     target = np.array([4.8, 0.5])
-
     occupancy_map = update_occupancy_map(sensor_data)
-    # Velocity command in world frame
-    vel_world = get_velocity_command(sensor_data, occupancy_map, target)
+    obstacles = map_to_global(np.argwhere(occupancy_map <= -0.2))
+    pos_global = np.array([sensor_data["x_global"], sensor_data["y_global"]])
+    vel = get_velocity_command(pos=pos_global, target=target, obstacles=obstacles)
+
     # Velocity command in local frame
-    vel_local = rotate(vel_world, -sensor_data["yaw"])
+    vel_local = rotate(vel, -sensor_data["yaw"])
+    control_command = [0.0, 0.0, height_desired, 2.0]
     control_command[:2] = vel_local
 
     if t % 10 == 0:
-        map_image = create_map_image(occupancy_map, sensor_data)
+        map_image = create_map_image(
+            sensor_data=sensor_data,
+            occupancy_map=occupancy_map,
+            obstacles=obstacles,
+            target=target,
+        )
         cv2.imshow("map", map_image)
         cv2.waitKey(1)
     t += 1
@@ -89,7 +96,12 @@ def get_command(sensor_data, camera_data, dt):
     return control_command
 
 
-def create_map_image(occupancy_map: np.ndarray, sensor_data: dict) -> np.ndarray:
+def create_map_image(
+    sensor_data: dict,
+    occupancy_map: np.ndarray,
+    obstacles: np.ndarray,
+    target: np.ndarray,
+) -> np.ndarray:
     map_grayscale = np.clip((occupancy_map + 1.0) * 0.5 * 255.0, 0.0, 255.0).astype(
         np.uint8
     )
@@ -104,11 +116,25 @@ def create_map_image(occupancy_map: np.ndarray, sensor_data: dict) -> np.ndarray
 
     pos_global = np.array([sensor_data["x_global"], sensor_data["y_global"]])
     yaw = sensor_data["yaw"]
-    pos_to_tip = np.array([np.cos(yaw), np.sin(yaw)]) * 0.08
+
+    """
+    x = np.linspace(MAP_X_MIN, MAP_X_MAX, IMG_SIZE_X)
+    y = np.linspace(MAP_Y_MIN, MAP_Y_MAX, IMG_SIZE_Y)
+    xx, yy = np.meshgrid(x, y)
+    positions = np.stack([xx, yy], axis=-1)
+    velocities = get_velocity_command(
+        pos=positions.reshape((-1, 2)), target=target, obstacles=obstacles
+    ).reshape(positions.shape)
+    velocities = np.linalg.norm(velocities, axis=-1, keepdims=True) / 0.5 * 255.0
+    img[:, :, :] = velocities.astype(np.uint8)
+    """
+
+    DRONE_SIZE = 0.1  # [m]
+    pos_to_tip = np.array([np.cos(yaw), np.sin(yaw)]) * DRONE_SIZE * 0.5
+    left = np.array([-pos_to_tip[1], pos_to_tip[0]])
     tip_global = pos_global + pos_to_tip
-    pos_to_left = np.array([pos_to_tip[1], -pos_to_tip[0]]) * 0.3
-    left_global = pos_global + pos_to_left
-    right_global = pos_global - pos_to_left
+    left_global = pos_global - pos_to_tip + left
+    right_global = pos_global - pos_to_tip - left
     pts = global_to_img(
         np.array(
             [
@@ -123,23 +149,18 @@ def create_map_image(occupancy_map: np.ndarray, sensor_data: dict) -> np.ndarray
         pts=[pts.reshape((-1, 1, 2))],
         isClosed=True,
         color=(0, 0, 255),
-        thickness=2,
+        thickness=1,
+        lineType=cv2.LINE_AA,
     )
 
     return np.flip(img, axis=0)
 
 
 def get_velocity_command(
-    sensor_data: dict, occupancy_map: np.ndarray, target: np.ndarray
+    pos: np.ndarray, target: np.ndarray, obstacles: np.ndarray
 ) -> np.ndarray:
-    # In (y, x) map indices
-    obstacles = np.argwhere(occupancy_map <= -0.2)
-    # In (x, y) global frame
-    obstacles = map_to_global(obstacles)
-    pos_global = np.array([sensor_data["x_global"], sensor_data["y_global"]])
-    # In (x, y) global frame
-    vel_attractive = attraction_to_target(pos_global, target)
-    vel_repulsive = repulsion(pos_global, obstacles)
+    vel_attractive = attraction_to_target(pos, target)
+    vel_repulsive = repulsion(pos, obstacles)
     vel = clip_norm(
         (vel_attractive + vel_repulsive).squeeze(), max_norm=0.3, epsilon=0.001
     )
@@ -179,15 +200,16 @@ def repulsion(pos: np.ndarray, obstacles: np.ndarray) -> np.ndarray:
         obstacles: positions of obstacles in world space
     """
     # FIXME: implement local minima avoidance from paper
-    MAX_REPULSION_VELOCITY = 0.3  # v0 [m/s]
+    MAX_REPULSION_VELOCITY = 0.5  # v0 [m/s]
     INFLUENCE_RADIUS = 0.4  # r0 [m]
     EPSILON = 0.001  # [m]
 
     # Repulsion from obstacles
-    obstacles_rel = obstacles.reshape((-1, 1, 2)) - pos.reshape((1, -1, 2))
+    obstacles_rel = obstacles.reshape((1, -1, 2)) - pos.reshape((-1, 1, 2))
     distances = np.linalg.norm(obstacles_rel, axis=-1, keepdims=1)
     close_mask = (distances >= EPSILON) & (distances < INFLUENCE_RADIUS)
-    obstacle_repulsion = np.sum(
+    # FIXME: this is useless but max_norm() is bugged
+    obstacle_repulsion = smooth_max(
         np.where(
             close_mask,
             MAX_REPULSION_VELOCITY
@@ -197,7 +219,7 @@ def repulsion(pos: np.ndarray, obstacles: np.ndarray) -> np.ndarray:
             / distances,
             0.0,
         ),
-        axis=0,
+        alpha=100.0,
     ).squeeze()
 
     # Repulsion from map borders
@@ -367,9 +389,37 @@ def rotate(vec: np.ndarray, angle: float) -> np.ndarray:
 def clip_norm(
     vec: np.ndarray, max_norm: float | np.ndarray, epsilon: float = 0.0
 ) -> np.ndarray:
-    norm = np.linalg.norm(vec, axis=-1)
+    """
+    Clips the norm of the input vector(s) to a maximum value.
+    If epsilon is greater than zero, sets the input vector(s) to zero
+    if its norm is smaller than epsilon.
+    """
+    norm = np.linalg.norm(vec, axis=-1, keepdims=True)
     return np.where(
         norm > max_norm,
         vec * (max_norm / norm),
         np.where(norm > epsilon, vec, 0.0) if epsilon > 0.0 else vec,
+    )
+
+
+def max_norm(vecs: np.ndarray) -> np.ndarray:
+    if any([dim == 0 for dim in vecs.shape]):
+        return np.zeros(2)
+    norms = np.linalg.norm(vecs, axis=-1, keepdims=True)
+    return vecs[:, np.argmax(norms, axis=-2), :]
+
+
+def smooth_max(vecs: np.ndarray, alpha: float) -> np.ndarray:
+    """
+    Applies the Boltzmann operator on the input vectors:
+    a sum of the vectors weighted by the softargmax of their norms.
+    Alpha is the exponential parameter.
+    The operation is performed over the last two dimensions (of shape (N, 2))
+    """
+    if any([dim == 0 for dim in vecs.shape]):
+        return np.zeros(2)
+    norms = np.linalg.norm(vecs, axis=-1, keepdims=True)
+    exp_norms = np.exp(alpha * norms)
+    return np.sum(vecs * exp_norms, axis=-2, keepdims=True) / np.sum(
+        exp_norms, axis=-2, keepdims=True
     )
