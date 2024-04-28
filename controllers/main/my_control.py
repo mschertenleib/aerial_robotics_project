@@ -71,14 +71,24 @@ def get_command(sensor_data, camera_data, dt):
 
     path = np.array(
         [
-            [1.0, 0.5, 1.0, 0.0],
-            [1.0, 2.5, 1.0, 0.0],
+            [3.7, 0.2, 1.0, 0.0],
+            [4.8, 0.4, 1.0, 0.0],
+            [3.7, 0.6, 1.0, 0.0],
+            [4.8, 0.8, 1.0, 0.0],
+            [3.7, 1.0, 1.0, 0.0],
+            [4.8, 1.2, 1.0, 0.0],
+            [3.7, 1.4, 1.0, 0.0],
+            [4.8, 1.6, 1.0, 0.0],
+            [3.7, 1.8, 1.0, 0.0],
+            [4.8, 2.0, 1.0, 0.0],
+            [3.7, 2.2, 1.0, 0.0],
+            [4.8, 2.4, 1.0, 0.0],
+            [3.7, 2.6, 1.0, 0.0],
+            [4.8, 2.8, 1.0, 0.0],
             [start_pos[0], start_pos[1], 1.0, 0.0],
         ]
     )
-    # target = np.array([4.8, 0.5])
-    setpoint = path_to_setpoint(path, sensor_data, dt)
-    target = setpoint[:2]
+    target = path_to_setpoint(path, sensor_data, dt)
 
     occupancy_map = update_occupancy_map(sensor_data)
 
@@ -119,7 +129,7 @@ def create_map_image(
     yaw = sensor_data["yaw"]
     DRONE_SIZE = 0.1  # [m]
     pos_to_tip = np.array([np.cos(yaw), np.sin(yaw)]) * DRONE_SIZE * 0.5
-    left = np.array([-pos_to_tip[1], pos_to_tip[0]])
+    left = np.array([-pos_to_tip[1], pos_to_tip[0]]) * 0.5
     tip_global = pos_global + pos_to_tip
     left_global = pos_global - pos_to_tip + left
     right_global = pos_global - pos_to_tip - left
@@ -152,104 +162,39 @@ def get_control_command(
     pos = np.array([sensor_data["x_global"], sensor_data["y_global"]])
     yaw = sensor_data["yaw"]
 
-    obstacles = map_to_global(np.argwhere(occupancy_map <= -0.2))
-
     vel_attractive = attraction_to_target(
-        pos, target, min_radius=0.01, max_radius=0.2, max_value=0.2
+        pos, target[:2], min_radius=0.01, max_radius=0.2, max_value=0.2
     )
+
+    obstacles = map_to_global(np.argwhere(occupancy_map <= -0.2))
     vel_repulsive = repulsion(pos, obstacles)
+
     norm_attractive = np.linalg.norm(vel_attractive)
     norm_repulsive = np.linalg.norm(vel_repulsive)
     if norm_repulsive > 0.001 and norm_attractive > 0.001:
         cos_angle = np.dot(vel_attractive, vel_repulsive) / (
             norm_attractive * norm_repulsive
         )
-        vel_corrective = (
-            CORRECTION_FACTOR
-            * cos_angle
-            * np.array([-vel_repulsive[1], vel_repulsive[0]])
-        )
+        perpendicular = np.array([-vel_repulsive[1], vel_repulsive[0]])
+        vel_corrective = CORRECTION_FACTOR* np.abs(cos_angle)* perpendicular
     else:
         vel_corrective = np.zeros(2)
+
     vel = clip_norm(
         (vel_attractive + vel_repulsive + vel_corrective).squeeze(),
         max_norm=0.3,
         epsilon=0.001,
     )
-    print(f"{vel_attractive} {vel_repulsive} {vel_corrective}")
+    print(
+        f"{np.linalg.norm(vel_attractive):7.4f}",
+        f"{np.linalg.norm(vel_repulsive):7.4f}",
+        f"{np.linalg.norm(vel_corrective):7.4f}",
+        f"{sensor_data["range_down"]:7.4f}",
+    )
 
     vel = rotate(vel, -yaw)
     control_command = [vel[0], vel[1], 1.0, 2.0]
     return control_command
-
-
-def get_control_command_old(sensor_data: dict, target: np.ndarray) -> np.ndarray:
-    """
-    Returns the control command [v_forward, v_left, alt, yaw_rate]
-    """
-
-    MAX_ATTRACTION = 0.3
-    ATTRACTION_ATTENUATION_RADIUS = 0.2
-    FRONT_INFLUENCE_RADIUS = 0.3
-    FRONT_MAX_REPULSION = 1.0
-    SIDE_INFLUENCE_RADIUS = 0.15
-    SIDE_MAX_REPULSION = 1.0
-    MAX_VELOCITY = 0.3
-    YAW_KP = 2.0
-    MAX_YAW_RATE = 2.0
-
-    pos = np.array([sensor_data["x_global"], sensor_data["y_global"]])
-    yaw = sensor_data["yaw"]
-    range_front = sensor_data["range_front"]
-    range_left = sensor_data["range_left"]
-    range_right = sensor_data["range_right"]
-
-    target_relative = target - pos
-    target_distance = np.linalg.norm(target_relative)
-    if target_distance < 0.01:
-        return np.zeros(4)
-
-    target_heading = np.arctan2(target_relative[1], target_relative[0])
-    yaw_error = clip_angle(target_heading - yaw)
-    yaw_rate = YAW_KP * yaw_error
-
-    v_forward = np.clip(
-        MAX_ATTRACTION / ATTRACTION_ATTENUATION_RADIUS * target_distance,
-        -MAX_ATTRACTION,
-        MAX_ATTRACTION,
-    ) - linear_repulsion(
-        distance=range_front,
-        radius=FRONT_INFLUENCE_RADIUS,
-        max_value=FRONT_MAX_REPULSION,
-    )
-
-    v_left = (
-        -linear_repulsion(
-            distance=range_left,
-            radius=SIDE_INFLUENCE_RADIUS,
-            max_value=SIDE_MAX_REPULSION,
-        )
-        + linear_repulsion(
-            distance=range_right,
-            radius=SIDE_INFLUENCE_RADIUS,
-            max_value=SIDE_MAX_REPULSION,
-        )
-        + linear_repulsion(
-            distance=range_front,
-            radius=FRONT_INFLUENCE_RADIUS,
-            max_value=FRONT_MAX_REPULSION,
-        )
-        * get_prefered_repulsion_side(pos, yaw)
-    )
-
-    v_forward_cmd = np.clip(v_forward, -MAX_VELOCITY, MAX_VELOCITY)
-    v_left_cmd = np.clip(v_left, -MAX_VELOCITY, MAX_VELOCITY)
-    alt_cmd = 1.0
-    yaw_rate_cmd = np.clip(yaw_rate, -MAX_YAW_RATE, MAX_YAW_RATE)
-
-    print(f"{v_forward_cmd:7.4f} {v_left_cmd:7.4f} {alt_cmd:7.4f} {yaw_rate_cmd:7.4f}")
-
-    return [v_forward_cmd, v_left_cmd, alt_cmd, yaw_rate_cmd]
 
 
 def attraction_to_target(
@@ -275,30 +220,6 @@ def attraction_to_target(
         max_norm=max_value,
         epsilon=0.001,
     )
-
-
-def linear_repulsion(distance: float, radius: float, max_value: float) -> float:
-    return max(max_value / radius * (radius - distance), 0.0)
-
-
-def get_prefered_repulsion_side(pos: np.ndarray, yaw: float) -> float:
-    # FIXME
-    return 1.0
-
-
-def distance_to_wall(pos: np.ndarray, dir: np.ndarray) -> float:
-    if np.abs(dir[0]) > 0.0001:
-        d_x_min = (MAP_X_MIN - pos[0]) / dir[0]
-        d_x_max = (MAP_X_MAX - pos[0]) / dir[0]
-    else:
-        d_x_min, d_x_max = np.inf, np.inf
-    if np.abs(dir[1]) > 0.0001:
-        d_y_min = (MAP_Y_MIN - pos[1]) / dir[1]
-        d_y_max = (MAP_Y_MAX - pos[1]) / dir[1]
-    else:
-        d_y_min, d_y_max = np.inf, np.inf
-    distances = np.array([d_x_min, d_x_max, d_y_min, d_y_max])
-    return np.min(distances[distances > 0.0])
 
 
 def repulsion(pos: np.ndarray, obstacles: np.ndarray) -> np.ndarray:
@@ -346,6 +267,28 @@ def repulsion(pos: np.ndarray, obstacles: np.ndarray) -> np.ndarray:
     )
 
     return obstacle_repulsion + border_repulsion
+
+
+def get_prefered_repulsion_sign(pos: np.ndarray, dir:np.ndarray) -> float:
+    if distance_to_wall(pos, dir) > distance_to_wall(pos, -dir):
+        return 1.0
+    else:
+        return -1.0
+
+
+def distance_to_wall(pos: np.ndarray, dir: np.ndarray) -> float:
+    if np.abs(dir[0]) > 0.0001:
+        d_x_min = (MAP_X_MIN - pos[0]) / dir[0]
+        d_x_max = (MAP_X_MAX - pos[0]) / dir[0]
+    else:
+        d_x_min, d_x_max = np.inf, np.inf
+    if np.abs(dir[1]) > 0.0001:
+        d_y_min = (MAP_Y_MIN - pos[1]) / dir[1]
+        d_y_max = (MAP_Y_MAX - pos[1]) / dir[1]
+    else:
+        d_y_min, d_y_max = np.inf, np.inf
+    distances = np.array([d_x_min, d_x_max, d_y_min, d_y_max])
+    return np.min(distances[distances > 0.0])
 
 
 def map_to_global(indices: np.ndarray) -> np.ndarray:
@@ -513,27 +456,4 @@ def clip_norm(
         norm > max_norm,
         vec * (max_norm / norm),
         np.where(norm > epsilon, vec, 0.0) if epsilon > 0.0 else vec,
-    )
-
-
-def max_norm(vecs: np.ndarray) -> np.ndarray:
-    if any([dim == 0 for dim in vecs.shape]):
-        return np.zeros(2)
-    norms = np.linalg.norm(vecs, axis=-1, keepdims=True)
-    return vecs[:, np.argmax(norms, axis=-2), :]
-
-
-def smooth_max(vecs: np.ndarray, alpha: float) -> np.ndarray:
-    """
-    Applies the Boltzmann operator on the input vectors:
-    a sum of the vectors weighted by the softargmax of their norms.
-    Alpha is the exponential parameter.
-    The operation is performed over the last two dimensions (of shape (N, 2))
-    """
-    if any([dim == 0 for dim in vecs.shape]):
-        return np.zeros(2)
-    norms = np.linalg.norm(vecs, axis=-1, keepdims=True)
-    exp_norms = np.exp(alpha * norms)
-    return np.sum(vecs * exp_norms, axis=-2, keepdims=True) / np.sum(
-        exp_norms, axis=-2, keepdims=True
     )
