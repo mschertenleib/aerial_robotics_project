@@ -15,20 +15,20 @@ import numpy as np
 # "range_back": Backward range finder distance
 # "yaw": Yaw angle (rad)
 
-# In meters
-MAP_X_MIN, MAP_X_MAX = 0.0, 5.0
-MAP_Y_MIN, MAP_Y_MAX = 0.0, 3.0
-MAP_RESOLUTION = 0.05
-SENSOR_RANGE_MAX = 2.0
-# In pixels
+MAP_X_MIN, MAP_X_MAX = 0.0, 5.0  # [m]
+MAP_Y_MIN, MAP_Y_MAX = 0.0, 3.0  # [m]
+MAP_RESOLUTION = 0.05  # [m]
+SENSOR_RANGE_MAX = 2.0  # [m]
 MAP_SIZE_X = int((MAP_X_MAX - MAP_X_MIN) / MAP_RESOLUTION)
 MAP_SIZE_Y = int((MAP_Y_MAX - MAP_Y_MIN) / MAP_RESOLUTION)
 
-CONFIDENCE = 0.2
-
-IMG_RESOLUTION = 0.01
+IMG_RESOLUTION = 0.01  # [m]
 IMG_SIZE_X = int((MAP_X_MAX - MAP_X_MIN) / IMG_RESOLUTION)
 IMG_SIZE_Y = int((MAP_Y_MAX - MAP_Y_MIN) / IMG_RESOLUTION)
+
+OBSTACLE_CONFIDENCE = 0.1
+OBSTACLE_RADIUS = 0.3  # [m]
+KERNEL_RADIUS = int(OBSTACLE_RADIUS / MAP_RESOLUTION)
 
 # Global variables
 on_ground = True
@@ -38,8 +38,9 @@ start_pos = None
 timer_done = None
 t = 0
 
-# 0 = unknown, 1 = free, -1 = occupied
+# 0 = free, 0.5 = unknown, 1 = occupied
 occupancy_map = np.zeros((MAP_SIZE_Y, MAP_SIZE_X), dtype=np.float32)
+occupancy_map[:] = 0.5
 
 cv2.namedWindow("map", cv2.WINDOW_NORMAL)
 cv2.resizeWindow("map", IMG_SIZE_X, IMG_SIZE_Y)
@@ -102,43 +103,50 @@ def get_command(sensor_data, camera_data, dt):
             occupancy_map=occupancy_map,
         )
         cv2.imshow("map", map_image)
-        
-        map_grayscale = np.clip((-occupancy_map + 1.0) * 0.5 * 255.0, 0.0, 255.0).astype(np.uint8)
-
-        kernel_radius = 5
-        kernel_size = 2*kernel_radius+1
-        x = np.linspace(-kernel_radius, kernel_radius, kernel_size).reshape((1, -1))
-        y = np.linspace(-kernel_radius, kernel_radius, kernel_size).reshape((-1, 1))
-        xv, yv = np.meshgrid(x, y)
-        kernel = np.maximum(kernel_radius + 0.5 - np.sqrt(np.square(xv) + np.square(yv)), 0.0)
-        kernel /= np.sum(kernel)
-        np.set_printoptions(precision=3, suppress=True)
-        print(kernel)
-        img = cv2.filter2D(map_grayscale, -1, kernel)
-        img = cv2.cvtColor(
-        cv2.resize(
-            img,
-            dsize=(IMG_SIZE_X, IMG_SIZE_Y),
-            interpolation=cv2.INTER_NEAREST,
-        ),
-        cv2.COLOR_GRAY2BGR,
-        )
-        cv2.imshow("img", np.flip(img, axis=0))
-    
         cv2.waitKey(1)
+
     t += 1
 
     # Ordered as array with: [v_forward_cmd, v_left_cmd, alt_cmd, yaw_rate_cmd]
     return control_command
 
 
+def build_potential_field(occupancy_map: np.ndarray) -> np.ndarray:
+    kernel = get_quadratic_kernel(KERNEL_RADIUS)
+    potential = cv2.filter2D(occupancy_map, -1, kernel)
+    return potential
+
+
+def get_linear_kernel(kernel_radius: int) -> np.ndarray:
+    kernel_size = 2 * kernel_radius + 1
+    x = np.linspace(-kernel_radius, kernel_radius, kernel_size)
+    y = np.linspace(-kernel_radius, kernel_radius, kernel_size)
+    xv, yv = np.meshgrid(x, y)
+    r = np.sqrt(np.square(xv) + np.square(yv))
+    kernel = np.maximum(kernel_radius - r, 0.0)
+    return kernel / kernel_radius  # np.sum(kernel)
+
+
+def get_quadratic_kernel(kernel_radius: int) -> np.ndarray:
+    kernel_size = 2 * kernel_radius + 1
+    x = np.linspace(-kernel_radius, kernel_radius, kernel_size)
+    y = np.linspace(-kernel_radius, kernel_radius, kernel_size)
+    xv, yv = np.meshgrid(x, y)
+    r = np.sqrt(np.square(xv) + np.square(yv))
+    kernel = np.square(np.maximum(kernel_radius - r, 0.0))
+    return kernel / np.sum(kernel)
+
+
+def draw_circle(event, x, y, flags, param):
+    if event == cv2.EVENT_LBUTTONDBLCLK:
+        cv2.circle(img, (x, y), 100, (255, 0, 0), -1)
+
+
 def create_map_image(
     sensor_data: dict,
     occupancy_map: np.ndarray,
 ) -> np.ndarray:
-    map_grayscale = np.clip((occupancy_map + 1.0) * 0.5 * 255.0, 0.0, 255.0).astype(
-        np.uint8
-    )
+    map_grayscale = np.clip((1.0 - occupancy_map) * 255.0, 0.0, 255.0).astype(np.uint8)
     img = cv2.cvtColor(
         cv2.resize(
             map_grayscale,
@@ -174,6 +182,47 @@ def create_map_image(
         lineType=cv2.LINE_AA,
     )
 
+    pot = build_potential_field(occupancy_map)
+    pot = np.clip(
+        cv2.resize(
+            1.0 - pot,
+            dsize=(IMG_SIZE_X, IMG_SIZE_Y),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        * 255.0,
+        0.0,
+        255.0,
+    ).astype(np.uint8)
+    pot = cv2.cvtColor(pot, cv2.COLOR_GRAY2BGR)
+    pot[..., :2] = 0
+
+    img = cv2.addWeighted(img, 0.5, pot, 0.5, 0.0)
+
+    # TEST
+    img = np.zeros_like(occupancy_map)
+    img[10, 20] = 1.0
+    img[11, 20] = 1.0
+    img[12, 20] = 1.0
+    img[14, 20] = 1.0
+    img[12, 23] = 1.0
+    print(img.min(), img.max(), end=" ")
+    kernel = get_quadratic_kernel(KERNEL_RADIUS)
+    img = cv2.filter2D(img, -1, kernel)
+    if img.max() > 0.0:
+        img /= img.max()
+    print(img.min(), img.max())
+    img = np.clip(
+        cv2.resize(
+            1.0 - img,
+            dsize=(IMG_SIZE_X, IMG_SIZE_Y),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        * 255.0,
+        0.0,
+        255.0,
+    ).astype(np.uint8)
+    img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
     return np.flip(img, axis=0)
 
 
@@ -199,7 +248,7 @@ def get_control_command(
             norm_attractive * norm_repulsive
         )
         perpendicular = np.array([-vel_repulsive[1], vel_repulsive[0]])
-        vel_corrective = CORRECTION_FACTOR* np.abs(cos_angle)* perpendicular
+        vel_corrective = CORRECTION_FACTOR * np.abs(cos_angle) * perpendicular
     else:
         vel_corrective = np.zeros(2)
 
@@ -208,12 +257,12 @@ def get_control_command(
         max_norm=0.3,
         epsilon=0.001,
     )
-    print(
-        f"{np.linalg.norm(vel_attractive):7.4f}",
-        f"{np.linalg.norm(vel_repulsive):7.4f}",
-        f"{np.linalg.norm(vel_corrective):7.4f}",
-        f"{sensor_data["range_down"]:7.4f}",
-    )
+    # print(
+    #    f"{np.linalg.norm(vel_attractive):7.4f}",
+    #    f"{np.linalg.norm(vel_repulsive):7.4f}",
+    #    f"{np.linalg.norm(vel_corrective):7.4f}",
+    #    f"{sensor_data["range_down"]:7.4f}",
+    # )
 
     vel = rotate(vel, -yaw)
     control_command = [vel[0], vel[1], 1.0, 2.0]
@@ -292,7 +341,7 @@ def repulsion(pos: np.ndarray, obstacles: np.ndarray) -> np.ndarray:
     return obstacle_repulsion + border_repulsion
 
 
-def get_prefered_repulsion_sign(pos: np.ndarray, dir:np.ndarray) -> float:
+def get_prefered_repulsion_sign(pos: np.ndarray, dir: np.ndarray) -> float:
     if distance_to_wall(pos, dir) > distance_to_wall(pos, -dir):
         return 1.0
     else:
@@ -373,13 +422,13 @@ def update_occupancy_map(sensor_data: dict) -> np.ndarray:
 
             if distance < measurement:
                 if is_index_valid_map(row=index[0], col=index[1]):
-                    occupancy_map[index[0], index[1]] += CONFIDENCE
+                    occupancy_map[index[0], index[1]] -= OBSTACLE_CONFIDENCE
             else:
                 if is_index_valid_map(row=index[0], col=index[1]):
-                    occupancy_map[index[0], index[1]] -= CONFIDENCE
+                    occupancy_map[index[0], index[1]] += OBSTACLE_CONFIDENCE
                 break
 
-    occupancy_map = np.clip(occupancy_map, -1.0, 1.0)
+    occupancy_map = np.clip(occupancy_map, 0.0, 1.0)
 
     return occupancy_map
 
