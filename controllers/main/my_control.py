@@ -102,6 +102,29 @@ def get_command(sensor_data, camera_data, dt):
             occupancy_map=occupancy_map,
         )
         cv2.imshow("map", map_image)
+        
+        map_grayscale = np.clip((-occupancy_map + 1.0) * 0.5 * 255.0, 0.0, 255.0).astype(np.uint8)
+
+        kernel_radius = 5
+        kernel_size = 2*kernel_radius+1
+        x = np.linspace(-kernel_radius, kernel_radius, kernel_size).reshape((1, -1))
+        y = np.linspace(-kernel_radius, kernel_radius, kernel_size).reshape((-1, 1))
+        xv, yv = np.meshgrid(x, y)
+        kernel = np.maximum(kernel_radius + 0.5 - np.sqrt(np.square(xv) + np.square(yv)), 0.0)
+        kernel /= np.sum(kernel)
+        np.set_printoptions(precision=3, suppress=True)
+        print(kernel)
+        img = cv2.filter2D(map_grayscale, -1, kernel)
+        img = cv2.cvtColor(
+        cv2.resize(
+            img,
+            dsize=(IMG_SIZE_X, IMG_SIZE_Y),
+            interpolation=cv2.INTER_NEAREST,
+        ),
+        cv2.COLOR_GRAY2BGR,
+        )
+        cv2.imshow("img", np.flip(img, axis=0))
+    
         cv2.waitKey(1)
     t += 1
 
