@@ -21,14 +21,11 @@ MAP_RESOLUTION = 0.05  # [m]
 SENSOR_RANGE_MAX = 2.0  # [m]
 MAP_SIZE_X = int((MAP_X_MAX - MAP_X_MIN) / MAP_RESOLUTION)
 MAP_SIZE_Y = int((MAP_Y_MAX - MAP_Y_MIN) / MAP_RESOLUTION)
-
 IMG_RESOLUTION = 0.005  # [m]
 IMG_SIZE_X = int((MAP_X_MAX - MAP_X_MIN) / IMG_RESOLUTION)
 IMG_SIZE_Y = int((MAP_Y_MAX - MAP_Y_MIN) / IMG_RESOLUTION)
-
 OBSTACLE_CONFIDENCE = 0.1
-OBSTACLE_RADIUS = 0.3  # [m]
-KERNEL_RADIUS = int(OBSTACLE_RADIUS / MAP_RESOLUTION)
+KERNEL_RADIUS = 8
 
 # Global variables
 g_on_ground = True
@@ -40,6 +37,7 @@ g_t = 0
 # 0 = free, 0.5 = unknown, 1 = occupied
 g_occupancy_map = np.zeros((MAP_SIZE_Y, MAP_SIZE_X), dtype=np.float32)
 g_occupancy_map[:] = 0.5
+g_first_map_update = True
 
 
 # Visualization
@@ -60,7 +58,7 @@ cv2.resizeWindow("map", IMG_SIZE_X, IMG_SIZE_Y)
 
 # This is the main function where you will implement your control algorithm
 def get_command(sensor_data, camera_data, dt):
-    global g_on_ground, g_start_pos, g_t, g_drone_positions
+    global g_on_ground, g_start_pos, g_t, g_drone_positions, g_first_map_update
 
     # Open a window to display the camera image
     # NOTE: Displaying the camera image will slow down the simulation, this is just for testing
@@ -103,11 +101,22 @@ def get_command(sensor_data, camera_data, dt):
     )
     target = path_to_setpoint(path, sensor_data, dt)
 
+    pos = np.array([sensor_data["x_global"], sensor_data["y_global"]])
+    yaw = sensor_data["yaw"]
+
+    if g_first_map_update:
+        cv2.circle(
+            g_occupancy_map,
+            global_to_map(pos)[::-1],
+            4,
+            color=0.0,
+            thickness=-1,
+        )
+        g_first_map_update = False
+
     occupancy_map = update_occupancy_map(sensor_data)
     potential_field = build_potential_field(occupancy_map)
 
-    pos = np.array([sensor_data["x_global"], sensor_data["y_global"]])
-    yaw = sensor_data["yaw"]
     control_command = get_control_command(
         pos=pos, yaw=yaw, target=target, potential_field=potential_field
     )
@@ -131,8 +140,14 @@ def get_command(sensor_data, camera_data, dt):
 
 
 def build_potential_field(occupancy_map: np.ndarray) -> np.ndarray:
+    potential = occupancy_map.copy()
+    BORDER_POTENTIAL = 1.5
+    potential[0, :] = BORDER_POTENTIAL
+    potential[-1, :] = BORDER_POTENTIAL
+    potential[:, 0] = BORDER_POTENTIAL
+    potential[:, -1] = BORDER_POTENTIAL
     kernel = get_kernel(KERNEL_RADIUS)
-    potential = cv2.filter2D(occupancy_map, -1, kernel)
+    potential = cv2.filter2D(potential, -1, kernel)
     return potential
 
 
@@ -277,7 +292,7 @@ def get_correction(
     CORRECTION_FACTOR = 0.5
 
     norm_attractive = np.linalg.norm(attraction)
-    norm_repulsive = np.linalg.norm(attraction)
+    norm_repulsive = np.linalg.norm(repulsion)
     if norm_repulsive < 0.001 or norm_attractive < 0.001:
         return np.zeros(2)
 
@@ -295,8 +310,8 @@ def create_image(
     potential_field: np.ndarray,
 ) -> np.ndarray:
 
-    grayscale = np.clip((1.0 - occupancy_map) * 255.0, 0.0, 255.0).astype(np.uint8)
-    # grayscale = np.clip((1.0 - potential_field) * 255.0, 0.0, 255.0).astype(np.uint8)
+    # grayscale = np.clip((1.0 - occupancy_map) * 255.0, 0.0, 255.0).astype(np.uint8)
+    grayscale = np.clip((1.0 - potential_field) * 255.0, 0.0, 255.0).astype(np.uint8)
     grayscale = cv2.resize(
         grayscale,
         dsize=(IMG_SIZE_X, IMG_SIZE_Y),
