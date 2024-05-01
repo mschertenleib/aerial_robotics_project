@@ -41,8 +41,18 @@ t = 0
 # 0 = free, 0.5 = unknown, 1 = occupied
 occupancy_map = np.zeros((MAP_SIZE_Y, MAP_SIZE_X), dtype=np.float32)
 occupancy_map[:] = 0.5
+drone_positions = []
+g_mouse_x, g_mouse_y = 0, 0
+
+
+def mouse_callback(event, x, y, flags, param):
+    global g_mouse_x, g_mouse_y
+    if event == cv2.EVENT_MOUSEMOVE:
+        g_mouse_x, g_mouse_y = x, y
+
 
 cv2.namedWindow("map", cv2.WINDOW_NORMAL)
+cv2.setMouseCallback("map", mouse_callback)
 cv2.resizeWindow("map", IMG_SIZE_X, IMG_SIZE_Y)
 
 
@@ -89,18 +99,19 @@ def get_command(sensor_data, camera_data, dt):
             [start_pos[0], start_pos[1], 1.0, 0.0],
         ]
     )
+    path = np.array([[2.0, 1.0, 1.0, 0.0]])
     target = path_to_setpoint(path, sensor_data, dt)
-
     occupancy_map = update_occupancy_map(sensor_data)
-
+    potential_field = build_potential_field(occupancy_map)
     control_command = get_control_command(
         sensor_data=sensor_data, target=target, occupancy_map=occupancy_map
     )
 
-    if t % 10 == 0:
-        map_image = create_map_image(
+    if t % 2 == 0:
+        map_image = create_image(
             sensor_data=sensor_data,
             occupancy_map=occupancy_map,
+            potential_field=potential_field,
         )
         cv2.imshow("map", map_image)
         cv2.waitKey(1)
@@ -137,14 +148,67 @@ def get_quadratic_kernel(kernel_radius: int) -> np.ndarray:
     return kernel / np.sum(kernel)
 
 
-def draw_circle(event, x, y, flags, param):
-    if event == cv2.EVENT_LBUTTONDBLCLK:
-        cv2.circle(img, (x, y), 100, (255, 0, 0), -1)
+def get_repulsion(
+    pos: np.ndarray,
+    potential_field: np.ndarray,
+) -> np.ndarray:
+    grad = get_gradient(pos, potential_field)
+    return -grad
 
 
-def create_map_image(
+def get_gradient(
+    pos: np.ndarray,
+    potential_field: np.ndarray,
+) -> np.ndarray:
+    """
+    Returns a bilinear interpolation of the gradients at each cell corner.
+    The gradients at each cell corner are computed using the 2x2 adjacent cells.
+    """
+
+    map_pos = (pos - np.array([MAP_X_MIN, MAP_Y_MIN])) / MAP_RESOLUTION
+    map_pos_fractional, map_pos_integral = np.modf(map_pos)
+    i, j = int(map_pos_integral[1]), int(map_pos_integral[0])
+    x, y = map_pos_fractional[0], map_pos_fractional[1]
+
+    """
+              p1  |  p2  |  p3 
+             ----0,1----1,1----
+              p4  |  p0  |  p5 
+             ----0,0----1,0----
+              p6  |  p7  |  p8 
+    
+    ^ y,i
+    |
+    o---> x,j
+    """
+
+    p0 = potential_field[i, j]
+    p1 = potential_field[i + 1, j - 1]
+    p2 = potential_field[i + 1, j]
+    p3 = potential_field[i + 1, j + 1]
+    p4 = potential_field[i, j - 1]
+    p5 = potential_field[i, j + 1]
+    p6 = potential_field[i - 1, j - 1]
+    p7 = potential_field[i - 1, j]
+    p8 = potential_field[i - 1, j + 1]
+    grad_00 = 0.5 * np.array([p0 - p4 + p7 - p6, p4 - p6 + p0 - p7])
+    grad_10 = 0.5 * np.array([p5 - p0 + p8 - p7, p0 - p7 + p5 - p8])
+    grad_01 = 0.5 * np.array([p2 - p1 + p0 - p4, p1 - p4 + p2 - p0])
+    grad_11 = 0.5 * np.array([p3 - p2 + p5 - p0, p2 - p0 + p3 - p5])
+    grad = (
+        grad_00 * (1.0 - x) * (1.0 - y)
+        + grad_01 * (1.0 - x) * y
+        + grad_10 * x * (1.0 - y)
+        + grad_11 * x * y
+    )
+    print(grad_00, grad_10, grad_01, grad_11, grad)
+    return grad
+
+
+def create_image(
     sensor_data: dict,
     occupancy_map: np.ndarray,
+    potential_field: np.ndarray,
 ) -> np.ndarray:
     map_grayscale = np.clip((1.0 - occupancy_map) * 255.0, 0.0, 255.0).astype(np.uint8)
     img = cv2.cvtColor(
@@ -156,6 +220,23 @@ def create_map_image(
         cv2.COLOR_GRAY2BGR,
     )
 
+    pot = np.clip(
+        cv2.resize(
+            potential_field,
+            dsize=(IMG_SIZE_X, IMG_SIZE_Y),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        * 255.0,
+        0.0,
+        255.0,
+    ).astype(np.uint8)
+    pot = cv2.cvtColor(pot, cv2.COLOR_GRAY2BGR)
+
+    # pot[..., :2] = 0
+    # img = cv2.addWeighted(img, 0.5, pot, 0.5, 0.0)
+    img[:] = pot
+
+    # Draw drone
     pos_global = np.array([sensor_data["x_global"], sensor_data["y_global"]])
     yaw = sensor_data["yaw"]
     DRONE_SIZE = 0.1  # [m]
@@ -182,21 +263,15 @@ def create_map_image(
         lineType=cv2.LINE_AA,
     )
 
-    pot = build_potential_field(occupancy_map)
-    pot = np.clip(
-        cv2.resize(
-            1.0 - pot,
-            dsize=(IMG_SIZE_X, IMG_SIZE_Y),
-            interpolation=cv2.INTER_NEAREST,
-        )
-        * 255.0,
-        0.0,
-        255.0,
-    ).astype(np.uint8)
-    pot = cv2.cvtColor(pot, cv2.COLOR_GRAY2BGR)
-    pot[..., :2] = 0
+    offset = np.array([MAP_X_MIN, MAP_Y_MIN])
+    mouse_global = (np.array([g_mouse_x, g_mouse_y]) + 0.5) * IMG_RESOLUTION + offset
+    rep = get_repulsion(mouse_global, potential_field)
+    tip = mouse_global + rep * 100
+    tip = global_to_img(tip)
+    cv2.arrowedLine(img, (g_mouse_x, g_mouse_y), tip, color=255)
 
-    img = cv2.addWeighted(img, 0.5, pot, 0.5, 0.0)
+    # img[:] = np.flip(img, axis=0)
+    return img
 
     # TEST
     img = np.zeros_like(occupancy_map)
