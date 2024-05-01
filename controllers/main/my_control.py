@@ -2,6 +2,7 @@
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
+from enum import Enum
 
 # The available ground truth state measurements can be accessed by calling sensor_data[item].
 # All values of "item" are provided as defined in main.py lines 296-323.
@@ -27,6 +28,13 @@ IMG_SIZE_Y = int((MAP_Y_MAX - MAP_Y_MIN) / IMG_RESOLUTION)
 OBSTACLE_CONFIDENCE = 0.1
 KERNEL_RADIUS = 8
 
+
+class State(Enum):
+    STARTUP = 0
+    MOVE_TO_LANDING_ZONE = 1
+    FIND_LANDING_PAD = 2
+
+
 # Global variables
 g_on_ground = True
 g_height_desired = 1.0
@@ -38,6 +46,7 @@ g_t = 0
 g_occupancy_map = np.zeros((MAP_SIZE_Y, MAP_SIZE_X), dtype=np.float32)
 g_occupancy_map[:] = 0.5
 g_first_map_update = True
+g_state = State.STARTUP
 
 
 # Visualization
@@ -58,7 +67,7 @@ cv2.resizeWindow("map", IMG_SIZE_X, IMG_SIZE_Y)
 
 # This is the main function where you will implement your control algorithm
 def get_command(sensor_data, camera_data, dt):
-    global g_on_ground, g_start_pos, g_t, g_drone_positions, g_first_map_update
+    global g_on_ground, g_start_pos, g_t, g_drone_positions, g_first_map_update, g_state
 
     # Open a window to display the camera image
     # NOTE: Displaying the camera image will slow down the simulation, this is just for testing
@@ -117,9 +126,23 @@ def get_command(sensor_data, camera_data, dt):
     occupancy_map = update_occupancy_map(sensor_data)
     potential_field = build_potential_field(occupancy_map)
 
-    control_command = get_control_command(
-        pos=pos, yaw=yaw, target=target, potential_field=potential_field
-    )
+    print(g_state)
+
+    if g_state == State.STARTUP:
+        control_command = [0.0, 0.0, 1.0, 2.0]
+        if np.abs(yaw) > 2.0 * np.pi / 3.0:
+            g_state = State.MOVE_TO_LANDING_ZONE
+    elif g_state == State.MOVE_TO_LANDING_ZONE:
+        target = [4.5, 1.5, 1.0, 0.0]
+        control_command = get_control_command(
+            pos=pos, yaw=yaw, target=target, potential_field=potential_field
+        )
+        if pos[0] > 3.5: # TODO:check
+            g_state = State.FIND_LANDING_PAD
+    elif g_state == State.FIND_LANDING_PAD:
+        control_command = [0.0, 0.0, 0.0, 0.0]
+    else:
+        control_command = [0.0, 0.0, 0.0, 0.0]
 
     if g_t % 5 == 0:
         g_drone_positions += pos.tolist()
