@@ -20,13 +20,18 @@ MAP_X_MIN, MAP_X_MAX = 0.0, 5.0  # [m]
 MAP_Y_MIN, MAP_Y_MAX = 0.0, 3.0  # [m]
 MAP_RESOLUTION = 0.05  # [m]
 SENSOR_RANGE_MAX = 2.0  # [m]
+LANDING_ZONE_X = 3.5  # [m]
 MAP_SIZE_X = int((MAP_X_MAX - MAP_X_MIN) / MAP_RESOLUTION)
 MAP_SIZE_Y = int((MAP_Y_MAX - MAP_Y_MIN) / MAP_RESOLUTION)
+LANDING_ZONE_IDX = int((LANDING_ZONE_X - MAP_X_MIN) / MAP_RESOLUTION)
 IMG_RESOLUTION = 0.005  # [m]
 IMG_SIZE_X = int((MAP_X_MAX - MAP_X_MIN) / IMG_RESOLUTION)
 IMG_SIZE_Y = int((MAP_Y_MAX - MAP_Y_MIN) / IMG_RESOLUTION)
 OBSTACLE_CONFIDENCE = 0.1
-KERNEL_RADIUS = 9
+KERNEL_RADIUS_M = 0.45  # [m]
+KERNEL_RADIUS = int(KERNEL_RADIUS_M / MAP_RESOLUTION)
+EXPLORATION_RADIUS_M = 0.15  # [m]
+EXPLORATION_RADIUS = int(EXPLORATION_RADIUS_M / MAP_RESOLUTION)
 
 
 class State(Enum):
@@ -47,6 +52,8 @@ g_occupancy_map = np.zeros((MAP_SIZE_Y, MAP_SIZE_X), dtype=np.float32)
 g_occupancy_map[:] = 0.5
 g_first_map_update = True
 g_state = State.STARTUP
+g_to_explore = np.zeros((MAP_SIZE_Y, MAP_SIZE_X), dtype=bool)
+g_explored = np.zeros((MAP_SIZE_Y, MAP_SIZE_X), dtype=bool)
 
 
 # Visualization
@@ -89,7 +96,7 @@ def get_command(sensor_data, camera_data, dt):
 
     # ---- YOUR CODE HERE ----
 
-    path = np.array(
+    """path = np.array(
         [
             [3.7, 0.2, 1.0, 0.0],
             [4.8, 0.4, 1.0, 0.0],
@@ -108,8 +115,9 @@ def get_command(sensor_data, camera_data, dt):
             [g_start_pos[0], g_start_pos[1], 1.0, 0.0],
         ]
     )
-    target = path_to_setpoint(path, sensor_data, dt)
+    target = path_to_setpoint(path, sensor_data, dt)"""
 
+    target = [2.5, 1.5, 1.0, 0.0]
     pos = np.array([sensor_data["x_global"], sensor_data["y_global"]])
     yaw = sensor_data["yaw"]
 
@@ -125,6 +133,7 @@ def get_command(sensor_data, camera_data, dt):
 
     occupancy_map = update_occupancy_map(sensor_data)
     potential_field = build_potential_field(occupancy_map)
+    update_exploration(pos, potential_field)
 
     print(g_state)
 
@@ -132,6 +141,7 @@ def get_command(sensor_data, camera_data, dt):
         control_command = [0.0, 0.0, 1.0, 2.0]
         if np.abs(yaw) > 2.0 * np.pi / 3.0:
             g_state = State.MOVE_TO_LANDING_ZONE
+
     elif g_state == State.MOVE_TO_LANDING_ZONE:
         target = [4.5, 1.5, 1.0, 0.0]
         control_command = get_control_command(
@@ -139,10 +149,12 @@ def get_command(sensor_data, camera_data, dt):
         )
         if pos[0] > 3.5:
             g_state = State.FIND_LANDING_PAD
+
     elif g_state == State.FIND_LANDING_PAD:
-        control_command = [0.0, 0.0, 0.0, 0.0]
+        control_command = [0.0, 0.0, 1.0, 2.0]
+
     else:
-        control_command = [0.0, 0.0, 0.0, 0.0]
+        control_command = [0.0, 0.0, 1.0, 0.0]
 
     if g_t % 5 == 0:
         g_drone_positions += pos.tolist()
@@ -152,6 +164,8 @@ def get_command(sensor_data, camera_data, dt):
             target=target,
             occupancy_map=occupancy_map,
             potential_field=potential_field,
+            to_explore=g_to_explore,
+            explored=g_explored,
         )
         cv2.imshow("map", map_image)
         cv2.waitKey(1)
@@ -320,11 +334,27 @@ def get_correction(
         return np.zeros(2)
 
     cos_angle = np.dot(attraction, repulsion) / (norm_attractive * norm_repulsive)
+    if cos_angle >= 0.0:
+        return np.zeros(2)
+
     tangent = np.array([-repulsion[1], repulsion[0]])
     if np.cross(attraction, repulsion) >= 0.0:
         tangent *= -1.0
     # perpendicular = get_prefered_direction(pos, perpendicular)
     return CORRECTION_FACTOR * np.abs(cos_angle) * tangent
+
+
+def update_exploration(pos: np.ndarray, potential_field: np.ndarray) -> None:
+    global g_to_explore, g_explored
+    g_to_explore = potential_field < 0.1
+    g_to_explore[:, :LANDING_ZONE_IDX] = False
+    g_explored = cv2.circle(
+        g_explored.astype(np.uint8),
+        center=global_to_map(pos)[::-1],
+        radius=EXPLORATION_RADIUS,
+        color=1,
+        thickness=-1,
+    ).astype(bool)
 
 
 def create_image(
@@ -333,16 +363,21 @@ def create_image(
     target: np.ndarray,
     occupancy_map: np.ndarray,
     potential_field: np.ndarray,
+    to_explore: np.ndarray,
+    explored: np.ndarray,
 ) -> np.ndarray:
 
-    # grayscale = np.clip((1.0 - occupancy_map) * 255.0, 0.0, 255.0).astype(np.uint8)
-    grayscale = np.clip((1.0 - potential_field) * 255.0, 0.0, 255.0).astype(np.uint8)
-    grayscale = cv2.resize(
-        grayscale,
+    img = 1.0 - occupancy_map
+    #img = 1.0 - potential_field
+    img = np.clip(img * 255.0, 0.0, 255.0).astype(np.uint8)
+    img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    img[to_explore & ~explored] = (64, 192, 192)
+    img[to_explore & explored] = (192, 192, 64)
+    img = cv2.resize(
+        img,
         dsize=(IMG_SIZE_X, IMG_SIZE_Y),
         interpolation=cv2.INTER_NEAREST,
     )
-    img = cv2.cvtColor(grayscale, cv2.COLOR_GRAY2BGR)
 
     # Draw drone path
     if len(g_drone_positions) > 0:
