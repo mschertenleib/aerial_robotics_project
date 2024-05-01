@@ -1,20 +1,21 @@
-# Examples of basic methods for simulation competition
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 from enum import Enum
 
-# The available ground truth state measurements can be accessed by calling sensor_data[item].
-# All values of "item" are provided as defined in main.py lines 296-323.
+# The available ground truth state measurements can be accessed by calling sensor_data[item]. All values of "item" are provided as defined in main.py lines 296-323.
 # The "item" values that you can later use in the hardware project are:
 # "x_global": Global X position
 # "y_global": Global Y position
-# "range_down": Downward range finder distance
+# "range_down": Downward range finder distance (Used instead of Global Z distance)
 # "range_front": Front range finder distance
 # "range_left": Leftward range finder distance
 # "range_right": Rightward range finder distance
 # "range_back": Backward range finder distance
+# "roll": Roll angle (rad)
+# "pitch": Pitch angle (rad)
 # "yaw": Yaw angle (rad)
+
 
 MAP_X_MIN, MAP_X_MAX = 0.0, 5.0  # [m]
 MAP_Y_MIN, MAP_Y_MAX = 0.0, 3.0  # [m]
@@ -120,56 +121,61 @@ def get_command(sensor_data, camera_data, dt):
     potential_field = build_potential_field(occupancy_map)
     update_exploration(pos, potential_field)
 
-    print(f"{sensor_data["range_down"]:.3f}, {g_state}")
-
     if g_state == State.STARTUP:
+        do_rotate = True
         target = [pos[0], pos[1], 1.0, 0.0]
         if np.abs(yaw) > 2.0 * np.pi / 3.0:
             g_state = State.MOVE_TO_LANDING_ZONE
 
     elif g_state == State.MOVE_TO_LANDING_ZONE:
+        do_rotate = True
         target = [4.5, 1.5, 1.0, 0.0]
         if pos[0] > 3.5:
             g_state = State.FIND_LANDING_PAD
 
     elif g_state == State.FIND_LANDING_PAD:
+        do_rotate = True
         target = [pos[0], pos[1], 1.0, 0.0]
         target[:2] = get_exploration_target(pos)
         if sensor_data["range_down"] < LANDING_PAD_DETECT_RANGE:
             target = [pos[0], pos[1], 1.0, 0.0]
             g_start_time = g_t
             g_state = State.CONFIRM_LANDING_PAD
-    
+
     elif g_state == State.CONFIRM_LANDING_PAD:
+        do_rotate = False
         target = [pos[0], pos[1], 1.0, 0.0]
-        print(g_t - g_start_time)
-        if sensor_data["range_down"] > LANDING_PAD_DETECT_RANGE + 0.02:
-            g_state = State.FIND_LANDING_PAD
-        elif g_t >= g_start_time + 1.0:
+        if g_t >= g_start_time + 1.0 / dt:
             g_start_time = None
             g_state = State.LAND_ON_LANDING_PAD
 
     elif g_state == State.LAND_ON_LANDING_PAD:
+        do_rotate = False
         target = [pos[0], pos[1], 0.0, 0.0]
         if g_start_time is None and sensor_data["range_down"] < 0.03:
             g_start_time = g_t
-        elif g_start_time is not None and g_t >= g_start_time + 6.0 / dt:
+        elif g_start_time is not None and g_t >= g_start_time + 4.0 / dt:
+            g_start_time = g_t
             g_state = State.TAKE_OFF_FROM_LANDING_PAD
 
     elif g_state == State.TAKE_OFF_FROM_LANDING_PAD:
+        do_rotate = False
         target = [pos[0], pos[1], 1.0, 0.0]
-        if g_height_desired > 0.9:
+        if sensor_data["range_down"] > 0.9:
             g_state = State.BACK_TO_TAKE_OFF_PAD
 
     elif g_state == State.BACK_TO_TAKE_OFF_PAD:
+        do_rotate = True
         target = [g_start_pos[0], g_start_pos[1], 1.0, 0.0]
         if is_close(pos, target[:2]):
             g_state = State.FINAL_LANDING
 
     elif g_state == State.FINAL_LANDING:
+        do_rotate = False
         target = [g_start_pos[0], g_start_pos[1], 0.0, 0.0]
 
-    else:
+    else:  # This should never happen
+        do_rotate = False
         target = [pos[0], pos[1], g_height_desired, 0.0]
 
     control_command = get_control_command(
@@ -177,6 +183,7 @@ def get_command(sensor_data, camera_data, dt):
         yaw=yaw,
         target=np.array(target),
         dt=dt,
+        do_rotate=do_rotate,
         potential_field=potential_field,
     )
 
@@ -227,20 +234,22 @@ def get_control_command(
     yaw: float,
     target: np.ndarray,
     dt: float,
+    do_rotate: bool,
     potential_field: np.ndarray,
 ) -> np.ndarray:
     global g_height_desired
-    
+
     vel_cmd, _, _, _ = get_world_velocity_command(
         pos=pos, target=target[:2], potential_field=potential_field
     )
     vel_cmd = rotate(vel_cmd, -yaw)
-    VERTICAL_SPEED = 0.1 # [m/s]
+    VERTICAL_SPEED = 0.1  # [m/s]
     if target[2] > g_height_desired:
-        g_height_desired = min(g_height_desired + VERTICAL_SPEED * dt, target[2])
+        g_height_desired = target[2]
     elif target[2] < g_height_desired:
         g_height_desired = max(g_height_desired - VERTICAL_SPEED * dt, target[2])
-    control_command = [vel_cmd[0], vel_cmd[1], g_height_desired, 2.0]
+    yaw_rate_cmd = 2.0 if do_rotate else 0.0
+    control_command = [vel_cmd[0], vel_cmd[1], g_height_desired, yaw_rate_cmd]
     return control_command
 
 
@@ -389,20 +398,22 @@ def update_exploration(pos: np.ndarray, potential_field: np.ndarray) -> None:
 
 
 def get_exploration_target(pos: np.ndarray) -> np.ndarray:
+    global g_to_explore, g_explored
+
     unexplored = g_to_explore & ~g_explored
     idx_unexplored = np.argwhere(unexplored)
     if len(idx_unexplored) == 0:
-        print("Did not find landing pad, retrying...")
         g_explored = np.zeros_like(g_explored)
         return pos
+
     deltas = idx_unexplored - global_to_map(pos).reshape((1, 2))
     distances_sq = np.sum(np.square(deltas), axis=-1)
     min_dist_idx = np.argmin(distances_sq)
     return map_to_global(idx_unexplored[min_dist_idx, :])
 
 
-def is_close(pos:np.ndarray, target:np.ndarray) -> bool:
-    return np.linalg.norm(target-pos) < 0.1
+def is_close(pos: np.ndarray, target: np.ndarray) -> bool:
+    return np.linalg.norm(target - pos) < 0.1
 
 
 def create_image(
@@ -445,7 +456,7 @@ def create_image(
         color=(0, 0, 255),
         markerType=cv2.MARKER_TILTED_CROSS,
         markerSize=20,
-        thickness=3,
+        thickness=2,
         line_type=cv2.LINE_AA,
     )
 
@@ -500,55 +511,6 @@ def create_image(
     draw_arrows(pos=mouse_global, target=target)
 
     return np.flip(img, axis=0)
-
-
-def attraction_to_target(
-    pos: np.ndarray,
-    target: np.ndarray,
-    min_radius: float,
-    max_radius: float,
-    max_value: float,
-) -> np.ndarray:
-    """
-    Generates an attractive velocity to the target, in world frame.
-    The velocity profile is linear near the target and constant further away:
-        ||v(r)|| = v0 * r / r0    if r < r0
-        ||v(r)|| = v0             if r >= r0
-
-    Arguments:
-        pos: position of the drone in world space
-        target: position of the target in world space
-    """
-    # FIXME: min_radius
-    return clip_norm(
-        max_value / max_radius * (target - pos),
-        max_norm=max_value,
-        epsilon=0.001,
-    )
-
-
-def get_prefered_direction(pos: np.ndarray, dir: np.ndarray) -> float:
-    dist_pos = distance_to_wall(pos, dir)
-    dist_neg = distance_to_wall(pos, -dir)
-    if dist_pos > dist_neg:
-        return dir
-    else:
-        return -dir
-
-
-def distance_to_wall(pos: np.ndarray, dir: np.ndarray) -> float:
-    if np.abs(dir[0]) > 0.0001:
-        d_x_min = (MAP_X_MIN - pos[0]) / dir[0]
-        d_x_max = (MAP_X_MAX - pos[0]) / dir[0]
-    else:
-        d_x_min, d_x_max = np.inf, np.inf
-    if np.abs(dir[1]) > 0.0001:
-        d_y_min = (MAP_Y_MIN - pos[1]) / dir[1]
-        d_y_max = (MAP_Y_MAX - pos[1]) / dir[1]
-    else:
-        d_y_min, d_y_max = np.inf, np.inf
-    distances = np.array([d_x_min, d_x_max, d_y_min, d_y_max])
-    return np.min(distances[distances > 0.0])
 
 
 def map_to_global(indices: np.ndarray) -> np.ndarray:
@@ -707,13 +669,14 @@ def clip_norm(
     vec: np.ndarray, max_norm: float | np.ndarray, epsilon: float = 0.0
 ) -> np.ndarray:
     """
-    Clips the norm of the input vector(s) to a maximum value.
-    If epsilon is greater than zero, sets the input vector(s) to zero
+    Clips the norm of the input vector to a maximum value.
+    If epsilon is greater than zero, sets the input vector to zero
     if its norm is smaller than epsilon.
     """
-    norm = np.linalg.norm(vec, axis=-1, keepdims=True)
-    return np.where(
-        norm > max_norm,
-        vec * (max_norm / norm),
-        np.where(norm > epsilon, vec, 0.0) if epsilon > 0.0 else vec,
-    )
+    norm = np.linalg.norm(vec)
+    if norm > max_norm:
+        return vec * (max_norm / norm)
+    elif epsilon > 0.0 and norm < epsilon:
+        return np.zeros(2)
+    else:
+        return vec
