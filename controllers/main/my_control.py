@@ -26,7 +26,7 @@ IMG_RESOLUTION = 0.005  # [m]
 IMG_SIZE_X = int((MAP_X_MAX - MAP_X_MIN) / IMG_RESOLUTION)
 IMG_SIZE_Y = int((MAP_Y_MAX - MAP_Y_MIN) / IMG_RESOLUTION)
 OBSTACLE_CONFIDENCE = 0.1
-KERNEL_RADIUS = 8
+KERNEL_RADIUS = 9
 
 
 class State(Enum):
@@ -137,7 +137,7 @@ def get_command(sensor_data, camera_data, dt):
         control_command = get_control_command(
             pos=pos, yaw=yaw, target=target, potential_field=potential_field
         )
-        if pos[0] > 3.5: # TODO:check
+        if pos[0] > 3.5:
             g_state = State.FIND_LANDING_PAD
     elif g_state == State.FIND_LANDING_PAD:
         control_command = [0.0, 0.0, 0.0, 0.0]
@@ -164,7 +164,7 @@ def get_command(sensor_data, camera_data, dt):
 
 def build_potential_field(occupancy_map: np.ndarray) -> np.ndarray:
     potential = occupancy_map.copy()
-    BORDER_POTENTIAL = 1.5
+    BORDER_POTENTIAL = 2.0
     potential[0, :] = BORDER_POTENTIAL
     potential[-1, :] = BORDER_POTENTIAL
     potential[:, 0] = BORDER_POTENTIAL
@@ -187,7 +187,7 @@ def get_kernel(kernel_radius: int) -> np.ndarray:
 def get_control_command(
     pos: np.ndarray, yaw: float, target: np.ndarray, potential_field: np.ndarray
 ) -> np.ndarray:
-    vel, vel_attractive, vel_repulsive, vel_corrective = get_world_velocity_command(
+    vel, _, _, _ = get_world_velocity_command(
         pos=pos, target=target[:2], potential_field=potential_field
     )
     vel = rotate(vel, -yaw)
@@ -312,7 +312,7 @@ def get_gradient(
 def get_correction(
     pos: np.ndarray, attraction: np.ndarray, repulsion: np.ndarray
 ) -> np.ndarray:
-    CORRECTION_FACTOR = 0.5
+    CORRECTION_FACTOR = 0.3
 
     norm_attractive = np.linalg.norm(attraction)
     norm_repulsive = np.linalg.norm(repulsion)
@@ -320,9 +320,11 @@ def get_correction(
         return np.zeros(2)
 
     cos_angle = np.dot(attraction, repulsion) / (norm_attractive * norm_repulsive)
-    perpendicular = np.array([-repulsion[1], repulsion[0]])
-    perpendicular = get_prefered_direction(pos, perpendicular)
-    return CORRECTION_FACTOR * np.abs(cos_angle) * perpendicular
+    tangent = np.array([-repulsion[1], repulsion[0]])
+    if np.cross(attraction, repulsion) >= 0.0:
+        tangent *= -1.0
+    # perpendicular = get_prefered_direction(pos, perpendicular)
+    return CORRECTION_FACTOR * np.abs(cos_angle) * tangent
 
 
 def create_image(
