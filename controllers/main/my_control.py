@@ -31,17 +31,19 @@ OBSTACLE_RADIUS = 0.3  # [m]
 KERNEL_RADIUS = int(OBSTACLE_RADIUS / MAP_RESOLUTION)
 
 # Global variables
-on_ground = True
-height_desired = 1.0
-timer = None
-start_pos = None
-timer_done = None
-t = 0
-
+g_on_ground = True
+g_height_desired = 1.0
+g_timer = None
+g_start_pos = None
+g_timer_done = None
+g_t = 0
 # 0 = free, 0.5 = unknown, 1 = occupied
-occupancy_map = np.zeros((MAP_SIZE_Y, MAP_SIZE_X), dtype=np.float32)
-occupancy_map[:] = 0.5
-drone_positions = []
+g_occupancy_map = np.zeros((MAP_SIZE_Y, MAP_SIZE_X), dtype=np.float32)
+g_occupancy_map[:] = 0.5
+
+
+# Visualization
+g_drone_positions = []
 g_mouse_x, g_mouse_y = 0, 0
 
 
@@ -58,7 +60,7 @@ cv2.resizeWindow("map", IMG_SIZE_X, IMG_SIZE_Y)
 
 # This is the main function where you will implement your control algorithm
 def get_command(sensor_data, camera_data, dt):
-    global on_ground, start_pos, t, drone_positions
+    global g_on_ground, g_start_pos, g_t, g_drone_positions
 
     # Open a window to display the camera image
     # NOTE: Displaying the camera image will slow down the simulation, this is just for testing
@@ -66,17 +68,17 @@ def get_command(sensor_data, camera_data, dt):
     # cv2.waitKey(1)
 
     # Take off
-    if start_pos is None:
-        start_pos = [
+    if g_start_pos is None:
+        g_start_pos = [
             sensor_data["x_global"],
             sensor_data["y_global"],
             sensor_data["range_down"],
         ]
-    if on_ground and sensor_data["range_down"] < 0.49:
-        control_command = [0.0, 0.0, height_desired, 0.0]
+    if g_on_ground and sensor_data["range_down"] < 0.49:
+        control_command = [0.0, 0.0, g_height_desired, 0.0]
         return control_command
     else:
-        on_ground = False
+        g_on_ground = False
 
     # ---- YOUR CODE HERE ----
 
@@ -96,7 +98,7 @@ def get_command(sensor_data, camera_data, dt):
             [4.8, 2.4, 1.0, 0.0],
             [3.7, 2.6, 1.0, 0.0],
             [4.8, 2.8, 1.0, 0.0],
-            [start_pos[0], start_pos[1], 1.0, 0.0],
+            [g_start_pos[0], g_start_pos[1], 1.0, 0.0],
         ]
     )
     target = path_to_setpoint(path, sensor_data, dt)
@@ -110,8 +112,8 @@ def get_command(sensor_data, camera_data, dt):
         pos=pos, yaw=yaw, target=target, potential_field=potential_field
     )
 
-    if t % 5 == 0:
-        drone_positions += pos.tolist()
+    if g_t % 5 == 0:
+        g_drone_positions += pos.tolist()
         map_image = create_image(
             pos=pos,
             yaw=yaw,
@@ -122,7 +124,7 @@ def get_command(sensor_data, camera_data, dt):
         cv2.imshow("map", map_image)
         cv2.waitKey(1)
 
-    t += 1
+    g_t += 1
 
     # Ordered as array with: [v_forward_cmd, v_left_cmd, alt_cmd, yaw_rate_cmd]
     return control_command
@@ -151,14 +153,6 @@ def get_control_command(
         pos=pos, target=target[:2], potential_field=potential_field
     )
     vel = rotate(vel, -yaw)
-
-    print(
-        f"{np.linalg.norm(vel_attractive):7.4f}",
-        f"{np.linalg.norm(vel_repulsive):7.4f}",
-        f"{np.linalg.norm(vel_corrective):7.4f}",
-        f"{np.linalg.norm(vel):7.4f}",
-    )
-
     control_command = [vel[0], vel[1], 1.0, 2.0]
     return control_command
 
@@ -166,30 +160,18 @@ def get_control_command(
 def get_world_velocity_command(
     pos: np.ndarray, target: np.ndarray, potential_field: np.ndarray
 ) -> np.ndarray:
-    CORRECTION_FACTOR = 1.0
-
     vel_attractive = get_attraction(
         pos=pos, target=target, min_radius=0.01, max_radius=0.2, max_value=0.2
     )
     vel_repulsive = get_repulsion(pos=pos, potential_field=potential_field)
-
-    norm_attractive = np.linalg.norm(vel_attractive)
-    norm_repulsive = np.linalg.norm(vel_repulsive)
-    if norm_repulsive > 0.001 and norm_attractive > 0.001:
-        cos_angle = np.dot(vel_attractive, vel_repulsive) / (
-            norm_attractive * norm_repulsive
-        )
-        perpendicular = np.array([-vel_repulsive[1], vel_repulsive[0]])
-        vel_corrective = CORRECTION_FACTOR * np.abs(cos_angle) * perpendicular
-    else:
-        vel_corrective = np.zeros(2)
-
+    vel_corrective = get_correction(
+        pos=pos, attraction=vel_attractive, repulsion=vel_repulsive
+    )
     vel = clip_norm(
         vel_attractive + vel_repulsive + vel_corrective,
         max_norm=0.3,
         epsilon=0.001,
     )
-
     return vel, vel_attractive, vel_repulsive, vel_corrective
 
 
@@ -222,7 +204,7 @@ def get_repulsion(
     pos: np.ndarray,
     potential_field: np.ndarray,
 ) -> np.ndarray:
-    GRADIENT_SCALE = 2.0
+    GRADIENT_SCALE = 4.0
     grad = get_gradient(pos, potential_field)
     return -grad * GRADIENT_SCALE
 
@@ -289,6 +271,22 @@ def get_gradient(
     return grad
 
 
+def get_correction(
+    pos: np.ndarray, attraction: np.ndarray, repulsion: np.ndarray
+) -> np.ndarray:
+    CORRECTION_FACTOR = 0.5
+
+    norm_attractive = np.linalg.norm(attraction)
+    norm_repulsive = np.linalg.norm(attraction)
+    if norm_repulsive < 0.001 or norm_attractive < 0.001:
+        return np.zeros(2)
+
+    cos_angle = np.dot(attraction, repulsion) / (norm_attractive * norm_repulsive)
+    perpendicular = np.array([-repulsion[1], repulsion[0]])
+    perpendicular = get_prefered_direction(pos, perpendicular)
+    return CORRECTION_FACTOR * np.abs(cos_angle) * perpendicular
+
+
 def create_image(
     pos: np.ndarray,
     yaw: float,
@@ -298,7 +296,7 @@ def create_image(
 ) -> np.ndarray:
 
     grayscale = np.clip((1.0 - occupancy_map) * 255.0, 0.0, 255.0).astype(np.uint8)
-    #grayscale = np.clip((1.0 - potential_field) * 255.0, 0.0, 255.0).astype(np.uint8)
+    # grayscale = np.clip((1.0 - potential_field) * 255.0, 0.0, 255.0).astype(np.uint8)
     grayscale = cv2.resize(
         grayscale,
         dsize=(IMG_SIZE_X, IMG_SIZE_Y),
@@ -307,8 +305,8 @@ def create_image(
     img = cv2.cvtColor(grayscale, cv2.COLOR_GRAY2BGR)
 
     # Draw drone path
-    if len(drone_positions) > 0:
-        pts = global_to_img(np.array(drone_positions))
+    if len(g_drone_positions) > 0:
+        pts = global_to_img(np.array(g_drone_positions))
         cv2.polylines(
             img,
             pts=[pts.reshape((-1, 1, 2))],
@@ -395,58 +393,13 @@ def attraction_to_target(
     )
 
 
-def repulsion(pos: np.ndarray, obstacles: np.ndarray) -> np.ndarray:
-    """
-    Generates a repulsive velocity from obstacles and map borders, in world frame.
-    The velocity profile is linear:
-        ||v(r)|| = v0 / r0 * (r0 - r)    if r < r0
-        ||v(r)|| = 0                     if r >= r0
-
-    Arguments:
-        pos: position(s) of the drone in world space
-        obstacles: positions of obstacles in world space
-    """
-
-    OBSTACLE_MAX_REPULSION = 0.2
-    OBSTACLE_INFLUENCE_RADIUS = 0.2
-    BORDER_MAX_REPULSION = 0.5
-    BORDER_INFLUENCE_RADIUS = 0.2
-    EPSILON = 0.001
-
-    # Repulsion from obstacles
-    obstacles_rel = obstacles.reshape((1, -1, 2)) - pos.reshape((-1, 1, 2))
-    distances = np.linalg.norm(obstacles_rel, axis=-1, keepdims=1)
-    close_mask = (distances >= EPSILON) & (distances < OBSTACLE_INFLUENCE_RADIUS)
-    obstacle_repulsion = np.sum(
-        np.where(
-            close_mask,
-            OBSTACLE_MAX_REPULSION
-            / OBSTACLE_INFLUENCE_RADIUS
-            * (distances - OBSTACLE_INFLUENCE_RADIUS)
-            * obstacles_rel
-            / distances,
-            0.0,
-        ),
-        axis=-2,
-    ).squeeze()
-
-    # Repulsion from map borders
-    delta_min = np.array([MAP_X_MIN, MAP_Y_MIN]) + BORDER_INFLUENCE_RADIUS - pos
-    delta_max = np.array([MAP_X_MAX, MAP_Y_MAX]) - BORDER_INFLUENCE_RADIUS - pos
-    border_repulsion = (
-        BORDER_MAX_REPULSION
-        / BORDER_INFLUENCE_RADIUS
-        * (np.maximum(delta_min, 0.0) + np.minimum(delta_max, 0.0))
-    )
-
-    return obstacle_repulsion + border_repulsion
-
-
-def get_prefered_repulsion_sign(pos: np.ndarray, dir: np.ndarray) -> float:
-    if distance_to_wall(pos, dir) > distance_to_wall(pos, -dir):
-        return 1.0
+def get_prefered_direction(pos: np.ndarray, dir: np.ndarray) -> float:
+    dist_pos = distance_to_wall(pos, dir)
+    dist_neg = distance_to_wall(pos, -dir)
+    if dist_pos > dist_neg:
+        return dir
     else:
-        return -1.0
+        return -dir
 
 
 def distance_to_wall(pos: np.ndarray, dir: np.ndarray) -> float:
@@ -504,7 +457,7 @@ def is_index_valid_map(row: int, col: int) -> bool:
 
 
 def update_occupancy_map(sensor_data: dict) -> np.ndarray:
-    global occupancy_map
+    global g_occupancy_map
 
     x_global = sensor_data["x_global"]
     y_global = sensor_data["y_global"]
@@ -523,56 +476,56 @@ def update_occupancy_map(sensor_data: dict) -> np.ndarray:
 
             if distance < measurement:
                 if is_index_valid_map(row=index[0], col=index[1]):
-                    occupancy_map[index[0], index[1]] -= OBSTACLE_CONFIDENCE
+                    g_occupancy_map[index[0], index[1]] -= OBSTACLE_CONFIDENCE
             else:
                 if is_index_valid_map(row=index[0], col=index[1]):
-                    occupancy_map[index[0], index[1]] += OBSTACLE_CONFIDENCE
+                    g_occupancy_map[index[0], index[1]] += OBSTACLE_CONFIDENCE
                 break
 
-    occupancy_map = np.clip(occupancy_map, 0.0, 1.0)
+    g_occupancy_map = np.clip(g_occupancy_map, 0.0, 1.0)
 
-    return occupancy_map
+    return g_occupancy_map
 
 
 # --- Control from the exercises ---
 
-index_current_setpoint = 0
+g_index_current_setpoint = 0
 
 
 def path_to_setpoint(path, sensor_data, dt):
-    global on_ground, height_desired, index_current_setpoint, timer, timer_done, start_pos
+    global g_on_ground, g_height_desired, g_index_current_setpoint, g_timer, g_timer_done, g_start_pos
 
     # Take off
-    if start_pos is None:
-        start_pos = [
+    if g_start_pos is None:
+        g_start_pos = [
             sensor_data["x_global"],
             sensor_data["y_global"],
             sensor_data["range_down"],
         ]
-    if on_ground and sensor_data["range_down"] < 0.49:
-        current_setpoint = [start_pos[0], start_pos[1], height_desired, 0.0]
+    if g_on_ground and sensor_data["range_down"] < 0.49:
+        current_setpoint = [g_start_pos[0], g_start_pos[1], g_height_desired, 0.0]
         return current_setpoint
     else:
-        on_ground = False
+        g_on_ground = False
 
     # Start timer
-    if (index_current_setpoint == 1) & (timer is None):
-        timer = 0
+    if (g_index_current_setpoint == 1) & (g_timer is None):
+        g_timer = 0
         print("Time recording started")
-    if timer is not None:
-        timer += dt
+    if g_timer is not None:
+        g_timer += dt
     # Hover at the final setpoint
-    if index_current_setpoint == len(path):
+    if g_index_current_setpoint == len(path):
         # Uncomment for KF
-        control_command = [start_pos[0], start_pos[1], start_pos[2] - 0.05, 0.0]
+        control_command = [g_start_pos[0], g_start_pos[1], g_start_pos[2] - 0.05, 0.0]
 
-        if timer_done is None:
-            timer_done = True
-            print("Path planing took " + str(np.round(timer, 1)) + " [s]")
+        if g_timer_done is None:
+            g_timer_done = True
+            print("Path planing took " + str(np.round(g_timer, 1)) + " [s]")
         return control_command
 
     # Get the goal position and drone position
-    current_setpoint = path[index_current_setpoint]
+    current_setpoint = path[g_index_current_setpoint]
     x_drone, y_drone, z_drone, yaw_drone = (
         sensor_data["x_global"],
         sensor_data["y_global"],
@@ -591,10 +544,10 @@ def path_to_setpoint(path, sensor_data, dt):
     # When the drone reaches the goal setpoint, e.g., distance < 0.1m
     if distance_drone_to_goal < 0.1:
         # Select the next setpoint as the goal position
-        index_current_setpoint += 1
+        g_index_current_setpoint += 1
         # Hover at the final setpoint
-        if index_current_setpoint == len(path):
-            current_setpoint = [0.0, 0.0, height_desired, 0.0]
+        if g_index_current_setpoint == len(path):
+            current_setpoint = [0.0, 0.0, g_height_desired, 0.0]
             return current_setpoint
 
     return current_setpoint
