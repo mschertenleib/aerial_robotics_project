@@ -22,7 +22,7 @@ SENSOR_RANGE_MAX = 2.0  # [m]
 MAP_SIZE_X = int((MAP_X_MAX - MAP_X_MIN) / MAP_RESOLUTION)
 MAP_SIZE_Y = int((MAP_Y_MAX - MAP_Y_MIN) / MAP_RESOLUTION)
 
-IMG_RESOLUTION = 0.01  # [m]
+IMG_RESOLUTION = 0.005  # [m]
 IMG_SIZE_X = int((MAP_X_MAX - MAP_X_MIN) / IMG_RESOLUTION)
 IMG_SIZE_Y = int((MAP_Y_MAX - MAP_Y_MIN) / IMG_RESOLUTION)
 
@@ -58,7 +58,7 @@ cv2.resizeWindow("map", IMG_SIZE_X, IMG_SIZE_Y)
 
 # This is the main function where you will implement your control algorithm
 def get_command(sensor_data, camera_data, dt):
-    global on_ground, start_pos, t
+    global on_ground, start_pos, t, drone_positions
 
     # Open a window to display the camera image
     # NOTE: Displaying the camera image will slow down the simulation, this is just for testing
@@ -99,17 +99,23 @@ def get_command(sensor_data, camera_data, dt):
             [start_pos[0], start_pos[1], 1.0, 0.0],
         ]
     )
-    path = np.array([[2.0, 1.0, 1.0, 0.0]])
     target = path_to_setpoint(path, sensor_data, dt)
+
     occupancy_map = update_occupancy_map(sensor_data)
     potential_field = build_potential_field(occupancy_map)
+
+    pos = np.array([sensor_data["x_global"], sensor_data["y_global"]])
+    yaw = sensor_data["yaw"]
     control_command = get_control_command(
-        sensor_data=sensor_data, target=target, occupancy_map=occupancy_map
+        pos=pos, yaw=yaw, target=target, potential_field=potential_field
     )
 
-    if t % 2 == 0:
+    if t % 5 == 0:
+        drone_positions += pos.tolist()
         map_image = create_image(
-            sensor_data=sensor_data,
+            pos=pos,
+            yaw=yaw,
+            target=target,
             occupancy_map=occupancy_map,
             potential_field=potential_field,
         )
@@ -137,6 +143,56 @@ def get_kernel(kernel_radius: int) -> np.ndarray:
     kernel = np.square(np.maximum(kernel_radius - r, 0.0))
     return kernel / np.sum(kernel)
 
+
+def get_control_command(
+    pos: np.ndarray, yaw: float, target: np.ndarray, potential_field: np.ndarray
+) -> np.ndarray:
+    vel, vel_attractive, vel_repulsive, vel_corrective = get_world_velocity_command(
+        pos=pos, target=target[:2], potential_field=potential_field
+    )
+    vel = rotate(vel, -yaw)
+
+    print(
+        f"{np.linalg.norm(vel_attractive):7.4f}",
+        f"{np.linalg.norm(vel_repulsive):7.4f}",
+        f"{np.linalg.norm(vel_corrective):7.4f}",
+        f"{np.linalg.norm(vel):7.4f}",
+    )
+
+    control_command = [vel[0], vel[1], 1.0, 2.0]
+    return control_command
+
+
+def get_world_velocity_command(
+    pos: np.ndarray, target: np.ndarray, potential_field: np.ndarray
+) -> np.ndarray:
+    CORRECTION_FACTOR = 1.0
+
+    vel_attractive = get_attraction(
+        pos=pos, target=target, min_radius=0.01, max_radius=0.2, max_value=0.2
+    )
+    vel_repulsive = get_repulsion(pos=pos, potential_field=potential_field)
+
+    norm_attractive = np.linalg.norm(vel_attractive)
+    norm_repulsive = np.linalg.norm(vel_repulsive)
+    if norm_repulsive > 0.001 and norm_attractive > 0.001:
+        cos_angle = np.dot(vel_attractive, vel_repulsive) / (
+            norm_attractive * norm_repulsive
+        )
+        perpendicular = np.array([-vel_repulsive[1], vel_repulsive[0]])
+        vel_corrective = CORRECTION_FACTOR * np.abs(cos_angle) * perpendicular
+    else:
+        vel_corrective = np.zeros(2)
+
+    vel = clip_norm(
+        vel_attractive + vel_repulsive + vel_corrective,
+        max_norm=0.3,
+        epsilon=0.001,
+    )
+
+    return vel, vel_attractive, vel_repulsive, vel_corrective
+
+
 def get_attraction(
     pos: np.ndarray,
     target: np.ndarray,
@@ -160,7 +216,6 @@ def get_attraction(
         max_norm=max_value,
         epsilon=0.001,
     )
-
 
 
 def get_repulsion(
@@ -235,45 +290,40 @@ def get_gradient(
 
 
 def create_image(
-    sensor_data: dict,
+    pos: np.ndarray,
+    yaw: float,
+    target: np.ndarray,
     occupancy_map: np.ndarray,
     potential_field: np.ndarray,
 ) -> np.ndarray:
-    map_grayscale = np.clip((1.0 - occupancy_map) * 255.0, 0.0, 255.0).astype(np.uint8)
-    img = cv2.cvtColor(
-        cv2.resize(
-            map_grayscale,
-            dsize=(IMG_SIZE_X, IMG_SIZE_Y),
-            interpolation=cv2.INTER_NEAREST,
-        ),
-        cv2.COLOR_GRAY2BGR,
+
+    grayscale = np.clip((1.0 - occupancy_map) * 255.0, 0.0, 255.0).astype(np.uint8)
+    #grayscale = np.clip((1.0 - potential_field) * 255.0, 0.0, 255.0).astype(np.uint8)
+    grayscale = cv2.resize(
+        grayscale,
+        dsize=(IMG_SIZE_X, IMG_SIZE_Y),
+        interpolation=cv2.INTER_NEAREST,
     )
+    img = cv2.cvtColor(grayscale, cv2.COLOR_GRAY2BGR)
 
-    pot = np.clip(
-        cv2.resize(
-            potential_field,
-            dsize=(IMG_SIZE_X, IMG_SIZE_Y),
-            interpolation=cv2.INTER_NEAREST,
+    # Draw drone path
+    if len(drone_positions) > 0:
+        pts = global_to_img(np.array(drone_positions))
+        cv2.polylines(
+            img,
+            pts=[pts.reshape((-1, 1, 2))],
+            isClosed=False,
+            color=(192, 64, 192),
+            lineType=cv2.LINE_AA,
         )
-        * 255.0,
-        0.0,
-        255.0,
-    ).astype(np.uint8)
-    pot = cv2.cvtColor(pot, cv2.COLOR_GRAY2BGR)
-
-    # pot[..., :2] = 0
-    # img = cv2.addWeighted(img, 0.5, pot, 0.5, 0.0)
-    img[:] = pot
 
     # Draw drone
-    pos_global = np.array([sensor_data["x_global"], sensor_data["y_global"]])
-    yaw = sensor_data["yaw"]
-    DRONE_SIZE = 0.1  # [m]
+    DRONE_SIZE = 0.08
     pos_to_tip = np.array([np.cos(yaw), np.sin(yaw)]) * DRONE_SIZE * 0.5
     left = np.array([-pos_to_tip[1], pos_to_tip[0]]) * 0.5
-    tip_global = pos_global + pos_to_tip
-    left_global = pos_global - pos_to_tip + left
-    right_global = pos_global - pos_to_tip - left
+    tip_global = pos + pos_to_tip
+    left_global = pos - pos_to_tip + left
+    right_global = pos - pos_to_tip - left
     pts = global_to_img(
         np.array(
             [
@@ -287,90 +337,37 @@ def create_image(
         img,
         pts=[pts.reshape((-1, 1, 2))],
         isClosed=True,
-        color=(0, 0, 255),
+        color=(0, 0, 0),
         thickness=1,
         lineType=cv2.LINE_AA,
     )
 
-    offset = np.array([MAP_X_MIN, MAP_Y_MIN])
-    mouse_global = np.array([min(g_mouse_x, IMG_SIZE_X-1), min(g_mouse_y, IMG_SIZE_Y-1)]) * IMG_RESOLUTION + offset
-    rep = get_repulsion(mouse_global, potential_field)
-    tip = mouse_global + rep * 5
-    tip = global_to_img(tip)
-    cv2.arrowedLine(img, (g_mouse_x, g_mouse_y), tip, color=255)
-
-    # img[:] = np.flip(img, axis=0)
-    return img
-
-    # TEST
-    img = np.zeros_like(occupancy_map)
-    img[10, 20] = 1.0
-    img[11, 20] = 1.0
-    img[12, 20] = 1.0
-    img[14, 20] = 1.0
-    img[12, 23] = 1.0
-    print(img.min(), img.max(), end=" ")
-    kernel = get_kernel(KERNEL_RADIUS)
-    img = cv2.filter2D(img, -1, kernel)
-    if img.max() > 0.0:
-        img /= img.max()
-    print(img.min(), img.max())
-    img = np.clip(
-        cv2.resize(
-            1.0 - img,
-            dsize=(IMG_SIZE_X, IMG_SIZE_Y),
-            interpolation=cv2.INTER_NEAREST,
+    def draw_arrows(pos: np.ndarray, target: np.ndarray) -> None:
+        vel, vel_attractive, vel_repulsive, vel_corrective = get_world_velocity_command(
+            pos=pos, target=target[:2], potential_field=potential_field
         )
-        * 255.0,
-        0.0,
-        255.0,
-    ).astype(np.uint8)
-    img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        scale = 2.0
+        pt1 = global_to_img(pos)
+        pt2 = global_to_img(pos + vel_attractive * scale)
+        cv2.arrowedLine(img, pt1, pt2, color=(64, 192, 64), line_type=cv2.LINE_AA)
+        pt2 = global_to_img(pos + vel_repulsive * scale)
+        cv2.arrowedLine(img, pt1, pt2, color=(64, 64, 192), line_type=cv2.LINE_AA)
+        pt2 = global_to_img(pos + vel_corrective * scale)
+        cv2.arrowedLine(img, pt1, pt2, color=(192, 64, 64), line_type=cv2.LINE_AA)
+        pt2 = global_to_img(pos + vel * scale)
+        cv2.arrowedLine(img, pt1, pt2, color=(0, 0, 0), line_type=cv2.LINE_AA)
+
+    # Draw attraction/repulsion on drone
+    draw_arrows(pos=pos, target=target)
+
+    # Draw attraction/repulsion at mouse position
+    offset = np.array([MAP_X_MIN, MAP_Y_MIN])
+    mouse_x = min(g_mouse_x, IMG_SIZE_X - 1)
+    mouse_y = max(IMG_SIZE_Y - 1 - g_mouse_y, 0)
+    mouse_global = np.array([mouse_x, mouse_y]) * IMG_RESOLUTION + offset
+    draw_arrows(pos=mouse_global, target=target)
 
     return np.flip(img, axis=0)
-
-
-def get_control_command(
-    sensor_data: dict, target: np.ndarray, occupancy_map: np.ndarray
-) -> np.ndarray:
-    CORRECTION_FACTOR = 1.0
-
-    pos = np.array([sensor_data["x_global"], sensor_data["y_global"]])
-    yaw = sensor_data["yaw"]
-
-    vel_attractive = attraction_to_target(
-        pos, target[:2], min_radius=0.01, max_radius=0.2, max_value=0.2
-    )
-
-    obstacles = map_to_global(np.argwhere(occupancy_map <= -0.2))
-    vel_repulsive = repulsion(pos, obstacles)
-
-    norm_attractive = np.linalg.norm(vel_attractive)
-    norm_repulsive = np.linalg.norm(vel_repulsive)
-    if norm_repulsive > 0.001 and norm_attractive > 0.001:
-        cos_angle = np.dot(vel_attractive, vel_repulsive) / (
-            norm_attractive * norm_repulsive
-        )
-        perpendicular = np.array([-vel_repulsive[1], vel_repulsive[0]])
-        vel_corrective = CORRECTION_FACTOR * np.abs(cos_angle) * perpendicular
-    else:
-        vel_corrective = np.zeros(2)
-
-    vel = clip_norm(
-        (vel_attractive + vel_repulsive + vel_corrective).squeeze(),
-        max_norm=0.3,
-        epsilon=0.001,
-    )
-    # print(
-    #    f"{np.linalg.norm(vel_attractive):7.4f}",
-    #    f"{np.linalg.norm(vel_repulsive):7.4f}",
-    #    f"{np.linalg.norm(vel_corrective):7.4f}",
-    #    f"{sensor_data["range_down"]:7.4f}",
-    # )
-
-    vel = rotate(vel, -yaw)
-    control_command = [vel[0], vel[1], 1.0, 2.0]
-    return control_command
 
 
 def attraction_to_target(
