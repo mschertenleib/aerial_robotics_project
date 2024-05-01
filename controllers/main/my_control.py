@@ -64,19 +64,20 @@ g_explored = np.zeros((MAP_SIZE_Y, MAP_SIZE_X), dtype=bool)
 g_start_time = None
 
 # Visualization
+enable_visualization = False
 g_drone_positions = []
 g_mouse_x, g_mouse_y = 0, 0
 
+if enable_visualization:
 
-def mouse_callback(event, x, y, flags, param):
-    global g_mouse_x, g_mouse_y
-    if event == cv2.EVENT_MOUSEMOVE:
-        g_mouse_x, g_mouse_y = x, y
+    def mouse_callback(event, x, y, flags, param):
+        global g_mouse_x, g_mouse_y
+        if event == cv2.EVENT_MOUSEMOVE:
+            g_mouse_x, g_mouse_y = x, y
 
-
-cv2.namedWindow("map", cv2.WINDOW_NORMAL)
-cv2.setMouseCallback("map", mouse_callback)
-cv2.resizeWindow("map", IMG_SIZE_X, IMG_SIZE_Y)
+    cv2.namedWindow("map", cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback("map", mouse_callback)
+    cv2.resizeWindow("map", IMG_SIZE_X, IMG_SIZE_Y)
 
 
 # This is the main function where you will implement your control algorithm
@@ -187,7 +188,7 @@ def get_command(sensor_data, camera_data, dt):
         potential_field=potential_field,
     )
 
-    if g_t % 5 == 0:
+    if enable_visualization and g_t % 5 == 0:
         g_drone_positions += pos.tolist()
         map_image = create_image(
             pos=pos,
@@ -243,7 +244,7 @@ def get_control_command(
         pos=pos, target=target[:2], potential_field=potential_field
     )
     vel_cmd = rotate(vel_cmd, -yaw)
-    VERTICAL_SPEED = 0.1  # [m/s]
+    VERTICAL_SPEED = 0.15  # [m/s]
     if target[2] > g_height_desired:
         g_height_desired = target[2]
     elif target[2] < g_height_desired:
@@ -380,7 +381,7 @@ def get_correction(
     tangent = np.array([-repulsion[1], repulsion[0]])
     if np.cross(attraction, repulsion) >= 0.0:
         tangent *= -1.0
-    # perpendicular = get_prefered_direction(pos, perpendicular)
+
     return CORRECTION_FACTOR * np.abs(cos_angle) * tangent
 
 
