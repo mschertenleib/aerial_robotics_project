@@ -28,16 +28,22 @@ IMG_RESOLUTION = 0.005  # [m]
 IMG_SIZE_X = int((MAP_X_MAX - MAP_X_MIN) / IMG_RESOLUTION)
 IMG_SIZE_Y = int((MAP_Y_MAX - MAP_Y_MIN) / IMG_RESOLUTION)
 OBSTACLE_CONFIDENCE = 0.1
-KERNEL_RADIUS_M = 0.45  # [m]
+KERNEL_RADIUS_M = 0.4  # [m]
 KERNEL_RADIUS = int(KERNEL_RADIUS_M / MAP_RESOLUTION)
-EXPLORATION_RADIUS_M = 0.15  # [m]
+EXPLORATION_RADIUS_M = 0.2  # [m]
 EXPLORATION_RADIUS = int(EXPLORATION_RADIUS_M / MAP_RESOLUTION)
+LANDING_PAD_DETECT_RANGE = 0.94
 
 
 class State(Enum):
     STARTUP = 0
     MOVE_TO_LANDING_ZONE = 1
     FIND_LANDING_PAD = 2
+    CONFIRM_LANDING_PAD = 3
+    LAND_ON_LANDING_PAD = 4
+    TAKE_OFF_FROM_LANDING_PAD = 5
+    BACK_TO_TAKE_OFF_PAD = 6
+    FINAL_LANDING = 7
 
 
 # Global variables
@@ -54,7 +60,7 @@ g_first_map_update = True
 g_state = State.STARTUP
 g_to_explore = np.zeros((MAP_SIZE_Y, MAP_SIZE_X), dtype=bool)
 g_explored = np.zeros((MAP_SIZE_Y, MAP_SIZE_X), dtype=bool)
-
+g_start_time = None
 
 # Visualization
 g_drone_positions = []
@@ -74,7 +80,8 @@ cv2.resizeWindow("map", IMG_SIZE_X, IMG_SIZE_Y)
 
 # This is the main function where you will implement your control algorithm
 def get_command(sensor_data, camera_data, dt):
-    global g_on_ground, g_start_pos, g_t, g_drone_positions, g_first_map_update, g_state
+    global g_on_ground, g_start_pos, g_t, g_drone_positions, g_first_map_update
+    global g_state, g_height_desired, g_start_time
 
     # Open a window to display the camera image
     # NOTE: Displaying the camera image will slow down the simulation, this is just for testing
@@ -96,28 +103,6 @@ def get_command(sensor_data, camera_data, dt):
 
     # ---- YOUR CODE HERE ----
 
-    """path = np.array(
-        [
-            [3.7, 0.2, 1.0, 0.0],
-            [4.8, 0.4, 1.0, 0.0],
-            [3.7, 0.6, 1.0, 0.0],
-            [4.8, 0.8, 1.0, 0.0],
-            [3.7, 1.0, 1.0, 0.0],
-            [4.8, 1.2, 1.0, 0.0],
-            [3.7, 1.4, 1.0, 0.0],
-            [4.8, 1.6, 1.0, 0.0],
-            [3.7, 1.8, 1.0, 0.0],
-            [4.8, 2.0, 1.0, 0.0],
-            [3.7, 2.2, 1.0, 0.0],
-            [4.8, 2.4, 1.0, 0.0],
-            [3.7, 2.6, 1.0, 0.0],
-            [4.8, 2.8, 1.0, 0.0],
-            [g_start_pos[0], g_start_pos[1], 1.0, 0.0],
-        ]
-    )
-    target = path_to_setpoint(path, sensor_data, dt)"""
-
-    target = [2.5, 1.5, 1.0, 0.0]
     pos = np.array([sensor_data["x_global"], sensor_data["y_global"]])
     yaw = sensor_data["yaw"]
 
@@ -135,33 +120,72 @@ def get_command(sensor_data, camera_data, dt):
     potential_field = build_potential_field(occupancy_map)
     update_exploration(pos, potential_field)
 
-    print(g_state)
+    print(f"{sensor_data["range_down"]:.3f}, {g_state}")
 
     if g_state == State.STARTUP:
-        control_command = [0.0, 0.0, 1.0, 2.0]
+        target = [pos[0], pos[1], 1.0, 0.0]
         if np.abs(yaw) > 2.0 * np.pi / 3.0:
             g_state = State.MOVE_TO_LANDING_ZONE
 
     elif g_state == State.MOVE_TO_LANDING_ZONE:
         target = [4.5, 1.5, 1.0, 0.0]
-        control_command = get_control_command(
-            pos=pos, yaw=yaw, target=target, potential_field=potential_field
-        )
         if pos[0] > 3.5:
             g_state = State.FIND_LANDING_PAD
 
     elif g_state == State.FIND_LANDING_PAD:
-        control_command = [0.0, 0.0, 1.0, 2.0]
+        target = [pos[0], pos[1], 1.0, 0.0]
+        target[:2] = get_exploration_target(pos)
+        if sensor_data["range_down"] < LANDING_PAD_DETECT_RANGE:
+            target = [pos[0], pos[1], 1.0, 0.0]
+            g_start_time = g_t
+            g_state = State.CONFIRM_LANDING_PAD
+    
+    elif g_state == State.CONFIRM_LANDING_PAD:
+        target = [pos[0], pos[1], 1.0, 0.0]
+        print(g_t - g_start_time)
+        if sensor_data["range_down"] > LANDING_PAD_DETECT_RANGE + 0.02:
+            g_state = State.FIND_LANDING_PAD
+        elif g_t >= g_start_time + 1.0:
+            g_start_time = None
+            g_state = State.LAND_ON_LANDING_PAD
+
+    elif g_state == State.LAND_ON_LANDING_PAD:
+        target = [pos[0], pos[1], 0.0, 0.0]
+        if g_start_time is None and sensor_data["range_down"] < 0.03:
+            g_start_time = g_t
+        elif g_start_time is not None and g_t >= g_start_time + 6.0 / dt:
+            g_state = State.TAKE_OFF_FROM_LANDING_PAD
+
+    elif g_state == State.TAKE_OFF_FROM_LANDING_PAD:
+        target = [pos[0], pos[1], 1.0, 0.0]
+        if g_height_desired > 0.9:
+            g_state = State.BACK_TO_TAKE_OFF_PAD
+
+    elif g_state == State.BACK_TO_TAKE_OFF_PAD:
+        target = [g_start_pos[0], g_start_pos[1], 1.0, 0.0]
+        if is_close(pos, target[:2]):
+            g_state = State.FINAL_LANDING
+
+    elif g_state == State.FINAL_LANDING:
+        target = [g_start_pos[0], g_start_pos[1], 0.0, 0.0]
 
     else:
-        control_command = [0.0, 0.0, 1.0, 0.0]
+        target = [pos[0], pos[1], g_height_desired, 0.0]
+
+    control_command = get_control_command(
+        pos=pos,
+        yaw=yaw,
+        target=np.array(target),
+        dt=dt,
+        potential_field=potential_field,
+    )
 
     if g_t % 5 == 0:
         g_drone_positions += pos.tolist()
         map_image = create_image(
             pos=pos,
             yaw=yaw,
-            target=target,
+            target=np.array(target),
             occupancy_map=occupancy_map,
             potential_field=potential_field,
             to_explore=g_to_explore,
@@ -199,22 +223,31 @@ def get_kernel(kernel_radius: int) -> np.ndarray:
 
 
 def get_control_command(
-    pos: np.ndarray, yaw: float, target: np.ndarray, potential_field: np.ndarray
+    pos: np.ndarray,
+    yaw: float,
+    target: np.ndarray,
+    dt: float,
+    potential_field: np.ndarray,
 ) -> np.ndarray:
-    vel, _, _, _ = get_world_velocity_command(
+    global g_height_desired
+    
+    vel_cmd, _, _, _ = get_world_velocity_command(
         pos=pos, target=target[:2], potential_field=potential_field
     )
-    vel = rotate(vel, -yaw)
-    control_command = [vel[0], vel[1], 1.0, 2.0]
+    vel_cmd = rotate(vel_cmd, -yaw)
+    VERTICAL_SPEED = 0.1 # [m/s]
+    if target[2] > g_height_desired:
+        g_height_desired = min(g_height_desired + VERTICAL_SPEED * dt, target[2])
+    elif target[2] < g_height_desired:
+        g_height_desired = max(g_height_desired - VERTICAL_SPEED * dt, target[2])
+    control_command = [vel_cmd[0], vel_cmd[1], g_height_desired, 2.0]
     return control_command
 
 
 def get_world_velocity_command(
     pos: np.ndarray, target: np.ndarray, potential_field: np.ndarray
 ) -> np.ndarray:
-    vel_attractive = get_attraction(
-        pos=pos, target=target, min_radius=0.01, max_radius=0.2, max_value=0.2
-    )
+    vel_attractive = get_attraction(pos=pos, target=target, radius=0.1, max_value=0.2)
     vel_repulsive = get_repulsion(pos=pos, potential_field=potential_field)
     vel_corrective = get_correction(
         pos=pos, attraction=vel_attractive, repulsion=vel_repulsive
@@ -230,8 +263,7 @@ def get_world_velocity_command(
 def get_attraction(
     pos: np.ndarray,
     target: np.ndarray,
-    min_radius: float,
-    max_radius: float,
+    radius: float,
     max_value: float,
 ) -> np.ndarray:
     """
@@ -244,9 +276,8 @@ def get_attraction(
         pos: position of the drone in world space
         target: position of the target in world space
     """
-    # FIXME: min_radius
     return clip_norm(
-        max_value / max_radius * (target - pos),
+        max_value / radius * (target - pos),
         max_norm=max_value,
         epsilon=0.001,
     )
@@ -357,6 +388,23 @@ def update_exploration(pos: np.ndarray, potential_field: np.ndarray) -> None:
     ).astype(bool)
 
 
+def get_exploration_target(pos: np.ndarray) -> np.ndarray:
+    unexplored = g_to_explore & ~g_explored
+    idx_unexplored = np.argwhere(unexplored)
+    if len(idx_unexplored) == 0:
+        print("Did not find landing pad, retrying...")
+        g_explored = np.zeros_like(g_explored)
+        return pos
+    deltas = idx_unexplored - global_to_map(pos).reshape((1, 2))
+    distances_sq = np.sum(np.square(deltas), axis=-1)
+    min_dist_idx = np.argmin(distances_sq)
+    return map_to_global(idx_unexplored[min_dist_idx, :])
+
+
+def is_close(pos:np.ndarray, target:np.ndarray) -> bool:
+    return np.linalg.norm(target-pos) < 0.1
+
+
 def create_image(
     pos: np.ndarray,
     yaw: float,
@@ -368,7 +416,7 @@ def create_image(
 ) -> np.ndarray:
 
     img = 1.0 - occupancy_map
-    #img = 1.0 - potential_field
+    # img = 1.0 - potential_field
     img = np.clip(img * 255.0, 0.0, 255.0).astype(np.uint8)
     img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     img[to_explore & ~explored] = (64, 192, 192)
@@ -389,6 +437,17 @@ def create_image(
             color=(192, 64, 192),
             lineType=cv2.LINE_AA,
         )
+
+    # Draw target
+    cv2.drawMarker(
+        img,
+        global_to_img(target[:2]),
+        color=(0, 0, 255),
+        markerType=cv2.MARKER_TILTED_CROSS,
+        markerSize=20,
+        thickness=3,
+        line_type=cv2.LINE_AA,
+    )
 
     # Draw drone
     DRONE_SIZE = 0.08
