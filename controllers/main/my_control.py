@@ -123,22 +123,12 @@ def get_command(sensor_data, camera_data, dt):
 
 
 def build_potential_field(occupancy_map: np.ndarray) -> np.ndarray:
-    kernel = get_quadratic_kernel(KERNEL_RADIUS)
+    kernel = get_kernel(KERNEL_RADIUS)
     potential = cv2.filter2D(occupancy_map, -1, kernel)
     return potential
 
 
-def get_linear_kernel(kernel_radius: int) -> np.ndarray:
-    kernel_size = 2 * kernel_radius + 1
-    x = np.linspace(-kernel_radius, kernel_radius, kernel_size)
-    y = np.linspace(-kernel_radius, kernel_radius, kernel_size)
-    xv, yv = np.meshgrid(x, y)
-    r = np.sqrt(np.square(xv) + np.square(yv))
-    kernel = np.maximum(kernel_radius - r, 0.0)
-    return kernel / kernel_radius  # np.sum(kernel)
-
-
-def get_quadratic_kernel(kernel_radius: int) -> np.ndarray:
+def get_kernel(kernel_radius: int) -> np.ndarray:
     kernel_size = 2 * kernel_radius + 1
     x = np.linspace(-kernel_radius, kernel_radius, kernel_size)
     y = np.linspace(-kernel_radius, kernel_radius, kernel_size)
@@ -147,13 +137,39 @@ def get_quadratic_kernel(kernel_radius: int) -> np.ndarray:
     kernel = np.square(np.maximum(kernel_radius - r, 0.0))
     return kernel / np.sum(kernel)
 
+def get_attraction(
+    pos: np.ndarray,
+    target: np.ndarray,
+    min_radius: float,
+    max_radius: float,
+    max_value: float,
+) -> np.ndarray:
+    """
+    Generates an attractive velocity to the target, in world frame.
+    The velocity profile is linear near the target and constant further away:
+        ||v(r)|| = v0 * r / r0    if r < r0
+        ||v(r)|| = v0             if r >= r0
+
+    Arguments:
+        pos: position of the drone in world space
+        target: position of the target in world space
+    """
+    # FIXME: min_radius
+    return clip_norm(
+        max_value / max_radius * (target - pos),
+        max_norm=max_value,
+        epsilon=0.001,
+    )
+
+
 
 def get_repulsion(
     pos: np.ndarray,
     potential_field: np.ndarray,
 ) -> np.ndarray:
+    GRADIENT_SCALE = 2.0
     grad = get_gradient(pos, potential_field)
-    return -grad
+    return -grad * GRADIENT_SCALE
 
 
 def get_gradient(
@@ -182,15 +198,29 @@ def get_gradient(
     o---> x,j
     """
 
+    i_is_min = i == 0
+    if i_is_min:
+        y = 1.0
+    i_is_max = i == potential_field.shape[0] - 1
+    if i_is_max:
+        y = 0.0
+    j_is_min = j == 0
+    if j_is_min:
+        x = 1.0
+    j_is_max = j == potential_field.shape[1] - 1
+    if j_is_max:
+        x = 0.0
+
     p0 = potential_field[i, j]
-    p1 = potential_field[i + 1, j - 1]
-    p2 = potential_field[i + 1, j]
-    p3 = potential_field[i + 1, j + 1]
-    p4 = potential_field[i, j - 1]
-    p5 = potential_field[i, j + 1]
-    p6 = potential_field[i - 1, j - 1]
-    p7 = potential_field[i - 1, j]
-    p8 = potential_field[i - 1, j + 1]
+    p1 = potential_field[i + 1, j - 1] if not i_is_max and not j_is_min else 0.0
+    p2 = potential_field[i + 1, j] if not i_is_max else 0.0
+    p3 = potential_field[i + 1, j + 1] if not i_is_max and not j_is_max else 0.0
+    p4 = potential_field[i, j - 1] if not j_is_min else 0.0
+    p5 = potential_field[i, j + 1] if not j_is_max else 0.0
+    p6 = potential_field[i - 1, j - 1] if not i_is_min and not j_is_min else 0.0
+    p7 = potential_field[i - 1, j] if not i_is_min else 0.0
+    p8 = potential_field[i - 1, j + 1] if not i_is_min and not j_is_max else 0.0
+
     grad_00 = 0.5 * np.array([p0 - p4 + p7 - p6, p4 - p6 + p0 - p7])
     grad_10 = 0.5 * np.array([p5 - p0 + p8 - p7, p0 - p7 + p5 - p8])
     grad_01 = 0.5 * np.array([p2 - p1 + p0 - p4, p1 - p4 + p2 - p0])
@@ -201,7 +231,6 @@ def get_gradient(
         + grad_10 * x * (1.0 - y)
         + grad_11 * x * y
     )
-    print(grad_00, grad_10, grad_01, grad_11, grad)
     return grad
 
 
@@ -264,9 +293,9 @@ def create_image(
     )
 
     offset = np.array([MAP_X_MIN, MAP_Y_MIN])
-    mouse_global = (np.array([g_mouse_x, g_mouse_y]) + 0.5) * IMG_RESOLUTION + offset
+    mouse_global = np.array([min(g_mouse_x, IMG_SIZE_X-1), min(g_mouse_y, IMG_SIZE_Y-1)]) * IMG_RESOLUTION + offset
     rep = get_repulsion(mouse_global, potential_field)
-    tip = mouse_global + rep * 100
+    tip = mouse_global + rep * 5
     tip = global_to_img(tip)
     cv2.arrowedLine(img, (g_mouse_x, g_mouse_y), tip, color=255)
 
@@ -281,7 +310,7 @@ def create_image(
     img[14, 20] = 1.0
     img[12, 23] = 1.0
     print(img.min(), img.max(), end=" ")
-    kernel = get_quadratic_kernel(KERNEL_RADIUS)
+    kernel = get_kernel(KERNEL_RADIUS)
     img = cv2.filter2D(img, -1, kernel)
     if img.max() > 0.0:
         img /= img.max()
