@@ -69,7 +69,7 @@ g_target = None
 g_pink_square_pos = None
 
 # Visualization
-g_enable_visualization = False
+g_enable_visualization = True
 g_drone_positions = []
 g_mouse_x, g_mouse_y = 0, 0
 
@@ -88,7 +88,7 @@ if g_enable_visualization:
 # This is the main function where you will implement your control algorithm
 def get_command(sensor_data, camera_data, dt):
     global g_on_ground, g_start_pos, g_t, g_drone_positions, g_first_map_update
-    global g_state, g_height_desired, g_start_time, g_enable_visualization, g_cam
+    global g_state, g_height_desired, g_start_time, g_enable_visualization
     global g_target, g_pink_square_pos
 
     # Take off

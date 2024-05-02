@@ -129,6 +129,3 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
-
-# Occupancy map
-map.png
