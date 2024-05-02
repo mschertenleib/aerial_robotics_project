@@ -38,13 +38,16 @@ LANDING_PAD_DETECT_RANGE = 0.94
 
 class State(Enum):
     STARTUP = 0
-    MOVE_TO_LANDING_ZONE = 1
-    FIND_LANDING_PAD = 2
-    CONFIRM_LANDING_PAD = 3
-    LAND_ON_LANDING_PAD = 4
-    TAKE_OFF_FROM_LANDING_PAD = 5
-    BACK_TO_TAKE_OFF_PAD = 6
-    FINAL_LANDING = 7
+    FIND_PINK_SQUARE = 1
+    MOVE_TO_PINK_SQUARE = 2
+    MOVE_TO_LANDING_ZONE = 3
+    FIND_LANDING_PAD = 4
+    CONFIRM_LANDING_PAD = 5
+    LAND_ON_LANDING_PAD = 6
+    TAKE_OFF_FROM_LANDING_PAD = 7
+    PASS_BY_PINK_SQUARE = 8
+    BACK_TO_TAKE_OFF_PAD = 9
+    FINAL_LANDING = 10
 
 
 # Global variables
@@ -62,13 +65,15 @@ g_state = State.STARTUP
 g_to_explore = np.zeros((MAP_SIZE_Y, MAP_SIZE_X), dtype=bool)
 g_explored = np.zeros((MAP_SIZE_Y, MAP_SIZE_X), dtype=bool)
 g_start_time = None
+g_target = None
+g_pink_square_pos = None
 
 # Visualization
-enable_visualization = False
+g_enable_visualization = False
 g_drone_positions = []
 g_mouse_x, g_mouse_y = 0, 0
 
-if enable_visualization:
+if g_enable_visualization:
 
     def mouse_callback(event, x, y, flags, param):
         global g_mouse_x, g_mouse_y
@@ -83,12 +88,8 @@ if enable_visualization:
 # This is the main function where you will implement your control algorithm
 def get_command(sensor_data, camera_data, dt):
     global g_on_ground, g_start_pos, g_t, g_drone_positions, g_first_map_update
-    global g_state, g_height_desired, g_start_time
-
-    # Open a window to display the camera image
-    # NOTE: Displaying the camera image will slow down the simulation, this is just for testing
-    # cv2.imshow('Camera Feed', camera_data)
-    # cv2.waitKey(1)
+    global g_state, g_height_desired, g_start_time, g_enable_visualization, g_cam
+    global g_target, g_pink_square_pos
 
     # Take off
     if g_start_pos is None:
@@ -124,35 +125,68 @@ def get_command(sensor_data, camera_data, dt):
 
     if g_state == State.STARTUP:
         do_rotate = True
-        target = [pos[0], pos[1], 1.0, 0.0]
+        g_target = [pos[0], pos[1], 1.0, 0.0]
         if np.abs(yaw) > 2.0 * np.pi / 3.0:
+            g_state = State.FIND_PINK_SQUARE
+
+    elif g_state == State.FIND_PINK_SQUARE:
+        pink_y, pink_x = np.nonzero(is_pink(camera_data))
+        if len(pink_x) > 0:
+            do_rotate = False
+            cam_y_error = np.mean(pink_y) - camera_data.shape[0] // 2
+            if cam_y_error > 10:
+                target_alt = g_height_desired - 0.05
+            elif cam_y_error < -10:
+                target_alt = g_height_desired + 0.05
+            else:
+                do_rotate = True
+                target_alt = g_height_desired
+            g_target = [pos[0], pos[1], target_alt, 0.0]
+
+            if np.abs(np.mean(pink_x) - camera_data.shape[1] // 2) < 5:
+                g_pink_square_pos = [
+                    2.5,
+                    pos[1] + (2.5 - pos[0]) * np.tan(yaw),
+                    target_alt,
+                ]
+                if target_alt == g_height_desired:
+                    g_state = State.MOVE_TO_PINK_SQUARE
+
+        else:
+            do_rotate = True
+            g_target = [1.5, 1.5 + np.sin(g_t / 1000.0), g_height_desired, 0.0]
+
+    elif g_state == State.MOVE_TO_PINK_SQUARE:
+        do_rotate = True
+        g_target = g_pink_square_pos + [0.0]
+        if pos[0] > 2.4:
             g_state = State.MOVE_TO_LANDING_ZONE
 
     elif g_state == State.MOVE_TO_LANDING_ZONE:
         do_rotate = True
-        target = [4.5, 1.5, 1.0, 0.0]
+        g_target = [4.5, 1.5, 1.0, 0.0]
         if pos[0] > 3.5:
             g_state = State.FIND_LANDING_PAD
 
     elif g_state == State.FIND_LANDING_PAD:
         do_rotate = True
-        target = [pos[0], pos[1], 1.0, 0.0]
-        target[:2] = get_exploration_target(pos)
+        g_target = [pos[0], pos[1], 1.0, 0.0]
+        g_target[:2] = get_exploration_target(pos)
         if sensor_data["range_down"] < LANDING_PAD_DETECT_RANGE:
-            target = [pos[0], pos[1], 1.0, 0.0]
+            g_target = [pos[0], pos[1], 1.0, 0.0]
             g_start_time = g_t
             g_state = State.CONFIRM_LANDING_PAD
 
     elif g_state == State.CONFIRM_LANDING_PAD:
         do_rotate = False
-        target = [pos[0], pos[1], 1.0, 0.0]
+        g_target = [pos[0], pos[1], 1.0, 0.0]
         if g_t >= g_start_time + 1.0 / dt:
             g_start_time = None
             g_state = State.LAND_ON_LANDING_PAD
 
     elif g_state == State.LAND_ON_LANDING_PAD:
         do_rotate = False
-        target = [pos[0], pos[1], 0.0, 0.0]
+        g_target = [pos[0], pos[1], 0.0, 0.0]
         if g_start_time is None and sensor_data["range_down"] < 0.03:
             g_start_time = g_t
         elif g_start_time is not None and g_t >= g_start_time + 4.0 / dt:
@@ -161,43 +195,52 @@ def get_command(sensor_data, camera_data, dt):
 
     elif g_state == State.TAKE_OFF_FROM_LANDING_PAD:
         do_rotate = False
-        target = [pos[0], pos[1], 1.0, 0.0]
+        g_target = [pos[0], pos[1], 1.0, 0.0]
         if sensor_data["range_down"] > 0.9:
+            g_state = State.PASS_BY_PINK_SQUARE
+
+    elif g_state == State.PASS_BY_PINK_SQUARE:
+        do_rotate = True
+        g_target = g_pink_square_pos + [0.0]
+        if pos[0] < 2.6:
             g_state = State.BACK_TO_TAKE_OFF_PAD
 
     elif g_state == State.BACK_TO_TAKE_OFF_PAD:
         do_rotate = True
-        target = [g_start_pos[0], g_start_pos[1], 1.0, 0.0]
-        if is_close(pos, target[:2]):
+        g_target = [g_start_pos[0], g_start_pos[1], 1.0, 0.0]
+        if np.linalg.norm(g_target[:2] - pos) < 0.1:
             g_state = State.FINAL_LANDING
 
     elif g_state == State.FINAL_LANDING:
         do_rotate = False
-        target = [g_start_pos[0], g_start_pos[1], 0.0, 0.0]
+        g_target = [g_start_pos[0], g_start_pos[1], 0.0, 0.0]
 
     else:  # This should never happen
         do_rotate = False
-        target = [pos[0], pos[1], g_height_desired, 0.0]
+        g_target = [pos[0], pos[1], g_height_desired, 0.0]
 
     control_command = get_control_command(
         pos=pos,
         yaw=yaw,
-        target=np.array(target),
+        target=np.array(g_target),
         dt=dt,
         do_rotate=do_rotate,
         potential_field=potential_field,
     )
 
-    if enable_visualization and g_t % 5 == 0:
+    if g_enable_visualization and g_t % 5 == 0:
         g_drone_positions += pos.tolist()
         map_image = create_image(
             pos=pos,
             yaw=yaw,
-            target=np.array(target),
+            target=np.array(g_target),
             occupancy_map=occupancy_map,
             potential_field=potential_field,
             to_explore=g_to_explore,
             explored=g_explored,
+            pink_square=(
+                np.array(g_pink_square_pos) if g_pink_square_pos is not None else None
+            ),
         )
         cv2.imshow("map", map_image)
         cv2.waitKey(1)
@@ -310,8 +353,10 @@ def get_gradient(
     Returns a bilinear interpolation of the gradients at each cell corner.
     The gradients at each cell corner are computed using the 2x2 adjacent cells.
     """
-
-    map_pos = (pos - np.array([MAP_X_MIN, MAP_Y_MIN])) / MAP_RESOLUTION
+    pos_safe = np.clip(
+        pos, [MAP_X_MIN, MAP_Y_MIN], [MAP_X_MAX - 0.001, MAP_Y_MAX - 0.001]
+    )
+    map_pos = (pos_safe - np.array([MAP_X_MIN, MAP_Y_MIN])) / MAP_RESOLUTION
     map_pos_fractional, map_pos_integral = np.modf(map_pos)
     i, j = int(map_pos_integral[1]), int(map_pos_integral[0])
     x, y = map_pos_fractional[0], map_pos_fractional[1]
@@ -387,7 +432,7 @@ def get_correction(
 
 def update_exploration(pos: np.ndarray, potential_field: np.ndarray) -> None:
     global g_to_explore, g_explored
-    g_to_explore = potential_field < 0.1
+    g_to_explore = potential_field < 0.12
     g_to_explore[:, :LANDING_ZONE_IDX] = False
     g_explored = cv2.circle(
         g_explored.astype(np.uint8),
@@ -413,8 +458,8 @@ def get_exploration_target(pos: np.ndarray) -> np.ndarray:
     return map_to_global(idx_unexplored[min_dist_idx, :])
 
 
-def is_close(pos: np.ndarray, target: np.ndarray) -> bool:
-    return np.linalg.norm(target - pos) < 0.1
+def is_pink(arr: np.ndarray) -> np.ndarray:
+    return (arr[..., 0] // 2 > arr[..., 1]) & (arr[..., 2] // 2 > arr[..., 1])
 
 
 def create_image(
@@ -425,6 +470,7 @@ def create_image(
     potential_field: np.ndarray,
     to_explore: np.ndarray,
     explored: np.ndarray,
+    pink_square: np.ndarray | None,
 ) -> np.ndarray:
 
     img = 1.0 - occupancy_map
@@ -460,6 +506,18 @@ def create_image(
         thickness=2,
         line_type=cv2.LINE_AA,
     )
+
+    # Draw pink square position
+    if pink_square is not None:
+        cv2.drawMarker(
+            img,
+            global_to_img(pink_square[:2]),
+            color=(255, 0, 255),
+            markerType=cv2.MARKER_SQUARE,
+            markerSize=20,
+            thickness=2,
+            line_type=cv2.LINE_AA,
+        )
 
     # Draw drone
     DRONE_SIZE = 0.08
