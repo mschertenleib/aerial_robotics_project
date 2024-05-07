@@ -70,6 +70,7 @@ g_pink_square_pos = None
 
 # Visualization
 g_enable_visualization = True
+g_use_potential_field = False
 g_drone_positions = []
 g_mouse_x, g_mouse_y = 0, 0
 
@@ -219,14 +220,22 @@ def get_command(sensor_data, camera_data, dt):
         do_rotate = False
         g_target = [pos[0], pos[1], g_height_desired, 0.0]
 
-    control_command = get_control_command(
-        pos=pos,
-        yaw=yaw,
-        target=np.array(g_target),
-        dt=dt,
-        do_rotate=do_rotate,
-        potential_field=potential_field,
-    )
+    if g_use_potential_field:
+        control_command = get_potential_field_control_command(
+            pos=pos,
+            yaw=yaw,
+            target=np.array(g_target),
+            dt=dt,
+            do_rotate=do_rotate,
+            potential_field=potential_field,
+        )
+    else:
+        control_command = get_control_command(
+            sensor_data=sensor_data,
+            target=np.array(g_target),
+            dt=dt,
+            do_rotate=do_rotate,
+        )
 
     if g_enable_visualization and g_t % 5 == 0:
         g_drone_positions += pos.tolist()
@@ -234,6 +243,7 @@ def get_command(sensor_data, camera_data, dt):
             pos=pos,
             yaw=yaw,
             target=np.array(g_target),
+            sensor_data=sensor_data,
             occupancy_map=occupancy_map,
             potential_field=potential_field,
             to_explore=g_to_explore,
@@ -273,7 +283,7 @@ def get_kernel(kernel_radius: int) -> np.ndarray:
     return kernel / np.sum(kernel)
 
 
-def get_control_command(
+def get_potential_field_control_command(
     pos: np.ndarray,
     yaw: float,
     target: np.ndarray,
@@ -283,7 +293,7 @@ def get_control_command(
 ) -> np.ndarray:
     global g_height_desired
 
-    vel_cmd, _, _, _ = get_world_velocity_command(
+    vel_cmd, _, _, _ = get_world_potential_field_velocity_command(
         pos=pos, target=target[:2], potential_field=potential_field
     )
     vel_cmd = rotate(vel_cmd, -yaw)
@@ -297,11 +307,13 @@ def get_control_command(
     return control_command
 
 
-def get_world_velocity_command(
+def get_world_potential_field_velocity_command(
     pos: np.ndarray, target: np.ndarray, potential_field: np.ndarray
 ) -> np.ndarray:
     vel_attractive = get_attraction(pos=pos, target=target, radius=0.1, max_value=0.2)
-    vel_repulsive = get_repulsion(pos=pos, potential_field=potential_field)
+    vel_repulsive = get_potential_field_repulsion(
+        pos=pos, potential_field=potential_field
+    )
     vel_corrective = get_correction(
         pos=pos, attraction=vel_attractive, repulsion=vel_repulsive
     )
@@ -311,6 +323,55 @@ def get_world_velocity_command(
         epsilon=0.001,
     )
     return vel, vel_attractive, vel_repulsive, vel_corrective
+
+
+def get_control_command(
+    sensor_data: np.ndarray,
+    target: np.ndarray,
+    dt: float,
+    do_rotate: bool,
+) -> np.ndarray:
+    global g_height_desired
+
+    vel_cmd, _, _ = get_world_velocity_command(
+        sensor_data=sensor_data, target=target[:2]
+    )
+    vel_cmd = rotate(vel_cmd, -sensor_data["yaw"])
+    VERTICAL_SPEED = 0.15  # [m/s]
+    if target[2] > g_height_desired:
+        g_height_desired = target[2]
+    elif target[2] < g_height_desired:
+        g_height_desired = max(g_height_desired - VERTICAL_SPEED * dt, target[2])
+    yaw_rate_cmd = 2.0 if do_rotate else 0.0
+    control_command = [vel_cmd[0], vel_cmd[1], g_height_desired, yaw_rate_cmd]
+    return control_command
+
+
+def get_world_velocity_command(
+    sensor_data: np.ndarray, target: np.ndarray
+) -> np.ndarray:
+    pos = np.array([sensor_data["x_global"], sensor_data["y_global"]])
+    yaw = sensor_data["yaw"]
+    range_front = sensor_data["range_front"]
+    range_left = sensor_data["range_left"]
+    range_back = sensor_data["range_back"]
+    range_right = sensor_data["range_right"]
+
+    vel_attractive = get_attraction(pos=pos, target=target, radius=0.1, max_value=0.2)
+    vel_repulsive = get_repulsion(
+        pos=pos,
+        range_front=range_front,
+        range_left=range_left,
+        range_back=range_back,
+        range_right=range_right,
+    )
+    vel_repulsive = rotate(vel_repulsive, -sensor_data["yaw"])
+    vel = clip_norm(
+        vel_attractive + vel_repulsive,
+        max_norm=0.3,
+        epsilon=0.001,
+    )
+    return vel, vel_attractive, vel_repulsive
 
 
 def get_attraction(
@@ -337,6 +398,17 @@ def get_attraction(
 
 
 def get_repulsion(
+    pos: np.ndarray,
+    range_front: float,
+    range_left: float,
+    range_back: float,
+    range_right: float,
+) -> np.ndarray:
+    # FIXME
+    return np.zeros(2)
+
+
+def get_potential_field_repulsion(
     pos: np.ndarray,
     potential_field: np.ndarray,
 ) -> np.ndarray:
@@ -466,6 +538,7 @@ def create_image(
     pos: np.ndarray,
     yaw: float,
     target: np.ndarray,
+    sensor_data: np.ndarray,
     occupancy_map: np.ndarray,
     potential_field: np.ndarray,
     to_explore: np.ndarray,
@@ -545,8 +618,13 @@ def create_image(
     )
 
     def draw_arrows(pos: np.ndarray, target: np.ndarray) -> None:
-        vel, vel_attractive, vel_repulsive, vel_corrective = get_world_velocity_command(
-            pos=pos, target=target[:2], potential_field=potential_field
+        if not g_use_potential_field:
+            return
+
+        vel, vel_attractive, vel_repulsive, vel_corrective = (
+            get_world_potential_field_velocity_command(
+                pos=pos, target=target[:2], potential_field=potential_field
+            )
         )
         scale = 2.0
         pt1 = global_to_img(pos)
