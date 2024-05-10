@@ -71,6 +71,7 @@ g_pink_square_pos = None
 # Visualization
 g_enable_visualization = True
 g_use_potential_field = False
+g_pink_square_detection = False
 g_drone_positions = []
 g_mouse_x, g_mouse_y = 0, 0
 
@@ -127,8 +128,11 @@ def get_command(sensor_data, camera_data, dt):
     if g_state == State.STARTUP:
         do_rotate = True
         g_target = [pos[0], pos[1], 1.0, 0.0]
-        if np.abs(yaw) > 2.0 * np.pi / 3.0:
-            g_state = State.FIND_PINK_SQUARE
+        if g_pink_square_detection:
+            if np.abs(yaw) > 2.0 * np.pi / 3.0:
+                g_state = State.FIND_PINK_SQUARE
+        else:
+            g_state = State.MOVE_TO_LANDING_ZONE
 
     elif g_state == State.FIND_PINK_SQUARE:
         pink_y, pink_x = np.nonzero(is_pink(camera_data))
@@ -198,7 +202,10 @@ def get_command(sensor_data, camera_data, dt):
         do_rotate = False
         g_target = [pos[0], pos[1], 1.0, 0.0]
         if sensor_data["range_down"] > 0.9:
-            g_state = State.PASS_BY_PINK_SQUARE
+            if g_pink_square_detection:
+                g_state = State.PASS_BY_PINK_SQUARE
+            else:
+                g_state = State.BACK_TO_TAKE_OFF_PAD
 
     elif g_state == State.PASS_BY_PINK_SQUARE:
         do_rotate = True
@@ -234,7 +241,7 @@ def get_command(sensor_data, camera_data, dt):
             sensor_data=sensor_data,
             target=np.array(g_target),
             dt=dt,
-            do_rotate=do_rotate,
+            do_rotate=False,
         )
 
     if g_enable_visualization and g_t % 5 == 0:
@@ -309,7 +316,7 @@ def get_potential_field_control_command(
 
 def get_world_potential_field_velocity_command(
     pos: np.ndarray, target: np.ndarray, potential_field: np.ndarray
-) -> np.ndarray:
+):
     vel_attractive = get_attraction(pos=pos, target=target, radius=0.1, max_value=0.2)
     vel_repulsive = get_potential_field_repulsion(
         pos=pos, potential_field=potential_field
@@ -333,7 +340,7 @@ def get_control_command(
 ) -> np.ndarray:
     global g_height_desired
 
-    vel_cmd, _, _ = get_world_velocity_command(
+    vel_cmd, _, _, _= get_world_velocity_command(
         sensor_data=sensor_data, target=target[:2]
     )
     vel_cmd = rotate(vel_cmd, -sensor_data["yaw"])
@@ -347,9 +354,7 @@ def get_control_command(
     return control_command
 
 
-def get_world_velocity_command(
-    sensor_data: np.ndarray, target: np.ndarray
-) -> np.ndarray:
+def get_world_velocity_command(sensor_data: np.ndarray, target: np.ndarray):
     pos = np.array([sensor_data["x_global"], sensor_data["y_global"]])
     yaw = sensor_data["yaw"]
     range_front = sensor_data["range_front"]
@@ -360,18 +365,21 @@ def get_world_velocity_command(
     vel_attractive = get_attraction(pos=pos, target=target, radius=0.1, max_value=0.2)
     vel_repulsive = get_repulsion(
         pos=pos,
+        yaw=yaw,
         range_front=range_front,
         range_left=range_left,
         range_back=range_back,
         range_right=range_right,
     )
-    vel_repulsive = rotate(vel_repulsive, -sensor_data["yaw"])
+    vel_corrective = get_correction(
+        pos=pos, attraction=vel_attractive, repulsion=vel_repulsive
+    )
     vel = clip_norm(
-        vel_attractive + vel_repulsive,
+        vel_attractive + vel_repulsive + vel_corrective,
         max_norm=0.3,
         epsilon=0.001,
     )
-    return vel, vel_attractive, vel_repulsive
+    return vel, vel_attractive, vel_repulsive, vel_corrective
 
 
 def get_attraction(
@@ -399,13 +407,25 @@ def get_attraction(
 
 def get_repulsion(
     pos: np.ndarray,
+    yaw: float,
     range_front: float,
     range_left: float,
     range_back: float,
     range_right: float,
 ) -> np.ndarray:
-    # FIXME
-    return np.zeros(2)
+    MAX_REPULSION = 0.6
+    REPULSION_RANGE = 0.4
+
+    def rep(range: float) -> float:
+        return max(MAX_REPULSION / REPULSION_RANGE * (REPULSION_RANGE - range), 0.0)
+
+    rep_local = np.array(
+        [rep(range_back) - rep(range_front), rep(range_right) - rep(range_left)]
+    )
+    rep_obstacles = rotate(rep_local, yaw)
+
+    rep_walls = np.zeros(2)
+    return rep_obstacles + rep_walls
 
 
 def get_potential_field_repulsion(
@@ -618,14 +638,16 @@ def create_image(
     )
 
     def draw_arrows(pos: np.ndarray, target: np.ndarray) -> None:
-        if not g_use_potential_field:
-            return
-
-        vel, vel_attractive, vel_repulsive, vel_corrective = (
-            get_world_potential_field_velocity_command(
-                pos=pos, target=target[:2], potential_field=potential_field
+        if g_use_potential_field:
+            vel, vel_attractive, vel_repulsive, vel_corrective = (
+                get_world_potential_field_velocity_command(
+                    pos=pos, target=target[:2], potential_field=potential_field
+                )
             )
-        )
+        else:
+            vel, vel_attractive, vel_repulsive, vel_corrective = get_world_velocity_command(
+                sensor_data=sensor_data, target=target[:2]
+            )
         scale = 2.0
         pt1 = global_to_img(pos)
         pt2 = global_to_img(pos + vel_attractive * scale)
@@ -645,7 +667,8 @@ def create_image(
     mouse_x = min(g_mouse_x, IMG_SIZE_X - 1)
     mouse_y = max(IMG_SIZE_Y - 1 - g_mouse_y, 0)
     mouse_global = np.array([mouse_x, mouse_y]) * IMG_RESOLUTION + offset
-    draw_arrows(pos=mouse_global, target=target)
+    if g_use_potential_field:
+        draw_arrows(pos=mouse_global, target=target)
 
     return np.flip(img, axis=0)
 
