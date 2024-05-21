@@ -21,8 +21,14 @@ KERNEL_RADIUS_M = 0.4  # [m]
 KERNEL_RADIUS = int(KERNEL_RADIUS_M / MAP_RESOLUTION)
 EXPLORATION_RADIUS_M = 0.2  # [m]
 EXPLORATION_RADIUS = int(EXPLORATION_RADIUS_M / MAP_RESOLUTION)
-CRUISING_HEIGHT = 0.5 # [m]
-LANDING_PAD_DETECT_RANGE = CRUISING_HEIGHT - 0.06 # [m]
+CRUISING_HEIGHT = 0.5  # [m]
+AIRBORNE_HEIGHT = CRUISING_HEIGHT - 0.1  # [m]
+LANDING_PAD_DETECT_RANGE = CRUISING_HEIGHT - 0.06  # [m]
+DIST_BETWEEN_SCANS = 1.0  # [m]
+DIST_BETWEEN_SCANS_LANDING_ZONE = 0.5  # [m]
+VERTICAL_SPEED = 0.2  # [m/s]
+YAW_STIFFNESS = 4.0
+YAW_RATE = 2.0  # [rad/s]
 
 USE_POTENTIAL_FIELD = True
 ENABLE_PINK_SQUARE = False
@@ -40,6 +46,7 @@ class State(Enum):
     PASS_BY_PINK_SQUARE = 8
     BACK_TO_TAKE_OFF_PAD = 9
     FINAL_LANDING = 10
+    SCANNING = 11
 
 
 # Global variables
@@ -58,7 +65,12 @@ g_to_explore = np.zeros((MAP_SIZE_Y, MAP_SIZE_X), dtype=bool)
 g_explored = np.zeros((MAP_SIZE_Y, MAP_SIZE_X), dtype=bool)
 g_start_time = None
 g_target = None
+g_rotate = False
 g_pink_square_pos = None
+g_resume_state: State = None
+g_last_scan_pos: np.ndarray = None
+g_total_scan_yaw = 0.0
+g_last_scan_yaw = 0.0
 
 # Visualization
 g_enable_visualization = True
@@ -80,8 +92,8 @@ if g_enable_visualization:
 # This is the main function where you will implement your control algorithm
 def get_command(sensor_data, camera_data, dt):
     global g_on_ground, g_start_pos, g_t, g_drone_positions, g_first_map_update
-    global g_state, g_current_target_height, g_start_time, g_enable_visualization
-    global g_target, g_pink_square_pos
+    global g_state, g_resume_state, g_current_target_height, g_start_time, g_enable_visualization
+    global g_target, g_pink_square_pos, g_rotate, g_last_scan_pos, g_total_scan_yaw, g_last_scan_yaw
 
     # Take off
     if g_start_pos is None:
@@ -104,8 +116,8 @@ def get_command(sensor_data, camera_data, dt):
     if g_first_map_update:
         cv2.circle(
             g_occupancy_map,
-            global_to_map(pos)[::-1],
-            4,
+            center=global_to_map(pos)[::-1],
+            radius=6,
             color=0.0,
             thickness=-1,
         )
@@ -115,26 +127,41 @@ def get_command(sensor_data, camera_data, dt):
     potential_field = build_potential_field(occupancy_map)
     update_exploration(pos, potential_field)
 
+    print(g_state)
+
     if g_state == State.STARTUP:
-        do_rotate = True
         g_target = [pos[0], pos[1], CRUISING_HEIGHT, 0.0]
-        if ENABLE_PINK_SQUARE:
-            if np.abs(yaw) > 2.0 * np.pi / 3.0:
-                g_state = State.FIND_PINK_SQUARE
-        else:
-            g_state = State.MOVE_TO_LANDING_ZONE
+        if sensor_data["range_down"] > AIRBORNE_HEIGHT:
+            g_resume_state = (
+                State.FIND_PINK_SQUARE
+                if ENABLE_PINK_SQUARE
+                else State.MOVE_TO_LANDING_ZONE
+            )
+            g_state = State.SCANNING
+
+    elif g_state == State.SCANNING:
+        g_rotate = True
+        g_target = [pos[0], pos[1], CRUISING_HEIGHT, 0.0]
+        g_last_scan_pos = pos.copy()
+        g_total_scan_yaw += clip_angle(yaw - g_last_scan_yaw)
+        g_last_scan_yaw = yaw
+        if g_total_scan_yaw > 1.8 * np.pi:
+            g_total_scan_yaw = 0.0
+            g_rotate = False
+            g_state = g_resume_state
 
     elif g_state == State.FIND_PINK_SQUARE:
+        # FIXME: this might be broken now
         pink_y, pink_x = np.nonzero(is_pink(camera_data))
         if len(pink_x) > 0:
-            do_rotate = False
+            g_rotate = False
             cam_y_error = np.mean(pink_y) - camera_data.shape[0] // 2
             if cam_y_error > 10:
                 target_alt = g_current_target_height - 0.05
             elif cam_y_error < -10:
                 target_alt = g_current_target_height + 0.05
             else:
-                do_rotate = True
+                g_rotate = True
                 target_alt = g_current_target_height
             g_target = [pos[0], pos[1], target_alt, 0.0]
 
@@ -148,39 +175,40 @@ def get_command(sensor_data, camera_data, dt):
                     g_state = State.MOVE_TO_PINK_SQUARE
 
         else:
-            do_rotate = True
+            g_rotate = True
             g_target = [1.5, 1.5 + np.sin(g_t / 1000.0), g_current_target_height, 0.0]
 
     elif g_state == State.MOVE_TO_PINK_SQUARE:
-        do_rotate = True
         g_target = g_pink_square_pos + [0.0]
         if pos[0] > 2.4:
             g_state = State.MOVE_TO_LANDING_ZONE
 
     elif g_state == State.MOVE_TO_LANDING_ZONE:
-        do_rotate = True
         g_target = [4.5, 1.5, CRUISING_HEIGHT, 0.0]
+        if np.linalg.norm(pos - g_last_scan_pos) > DIST_BETWEEN_SCANS:
+            g_resume_state = g_state
+            g_state = State.SCANNING
         if pos[0] > 3.5:
             g_state = State.FIND_LANDING_PAD
 
     elif g_state == State.FIND_LANDING_PAD:
-        do_rotate = True
         g_target = [pos[0], pos[1], CRUISING_HEIGHT, 0.0]
         g_target[:2] = get_exploration_target(pos)
+        if np.linalg.norm(pos - g_last_scan_pos) > DIST_BETWEEN_SCANS_LANDING_ZONE:
+            g_resume_state = g_state
+            g_state = State.SCANNING
         if sensor_data["range_down"] < LANDING_PAD_DETECT_RANGE:
             g_target = [pos[0], pos[1], CRUISING_HEIGHT, 0.0]
             g_start_time = g_t
             g_state = State.CONFIRM_LANDING_PAD
 
     elif g_state == State.CONFIRM_LANDING_PAD:
-        do_rotate = False
         g_target = [pos[0], pos[1], CRUISING_HEIGHT, 0.0]
         if g_t >= g_start_time + 1.0 / dt:
             g_start_time = None
             g_state = State.LAND_ON_LANDING_PAD
 
     elif g_state == State.LAND_ON_LANDING_PAD:
-        do_rotate = False
         g_target = [pos[0], pos[1], 0.0, 0.0]
         if g_start_time is None and sensor_data["range_down"] < 0.03:
             g_start_time = g_t
@@ -189,32 +217,31 @@ def get_command(sensor_data, camera_data, dt):
             g_state = State.TAKE_OFF_FROM_LANDING_PAD
 
     elif g_state == State.TAKE_OFF_FROM_LANDING_PAD:
-        do_rotate = False
         g_target = [pos[0], pos[1], CRUISING_HEIGHT, 0.0]
-        if sensor_data["range_down"] > CRUISING_HEIGHT - 0.1:
+        if sensor_data["range_down"] > AIRBORNE_HEIGHT:
             if ENABLE_PINK_SQUARE:
                 g_state = State.PASS_BY_PINK_SQUARE
             else:
                 g_state = State.BACK_TO_TAKE_OFF_PAD
 
     elif g_state == State.PASS_BY_PINK_SQUARE:
-        do_rotate = True
         g_target = g_pink_square_pos + [0.0]
         if pos[0] < 2.6:
             g_state = State.BACK_TO_TAKE_OFF_PAD
 
     elif g_state == State.BACK_TO_TAKE_OFF_PAD:
-        do_rotate = True
         g_target = [g_start_pos[0], g_start_pos[1], CRUISING_HEIGHT, 0.0]
-        if np.linalg.norm(g_target[:2] - pos) < 0.1:
+        if np.linalg.norm(pos - g_last_scan_pos) > DIST_BETWEEN_SCANS:
+            g_resume_state = g_state
+            g_state = State.SCANNING
+        if np.linalg.norm(g_target[:2] - pos) < 0.05:
             g_state = State.FINAL_LANDING
 
     elif g_state == State.FINAL_LANDING:
-        do_rotate = False
         g_target = [g_start_pos[0], g_start_pos[1], 0.0, 0.0]
 
     else:  # This should never happen
-        do_rotate = False
+        print("WE REACHED AN UNKNOWN STATE")
         g_target = [pos[0], pos[1], g_current_target_height, 0.0]
 
     if USE_POTENTIAL_FIELD:
@@ -223,7 +250,7 @@ def get_command(sensor_data, camera_data, dt):
             yaw=yaw,
             target=np.array(g_target),
             dt=dt,
-            do_rotate=do_rotate,
+            do_rotate=g_rotate,
             potential_field=potential_field,
         )
     else:
@@ -294,14 +321,18 @@ def get_potential_field_control_command(
         pos=pos, target=target[:2], potential_field=potential_field
     )
     vel_cmd = rotate(vel_cmd, -yaw)
-    VERTICAL_SPEED = 0.15  # [m/s]
     if target[2] > g_current_target_height:
         g_current_target_height = target[2]
     elif target[2] < g_current_target_height:
         g_current_target_height = max(
             g_current_target_height - VERTICAL_SPEED * dt, target[2]
         )
-    yaw_rate_cmd = 2.0 if do_rotate else 0.0
+    if do_rotate:
+        yaw_rate_cmd = YAW_RATE
+    else:
+        yaw_rate_cmd = np.clip(
+            YAW_STIFFNESS * clip_angle(target[3] - yaw), -YAW_RATE, YAW_RATE
+        )
     control_command = [vel_cmd[0], vel_cmd[1], g_current_target_height, yaw_rate_cmd]
     return control_command
 
@@ -343,7 +374,12 @@ def get_control_command(
         g_current_target_height = max(
             g_current_target_height - VERTICAL_SPEED * dt, target[2]
         )
-    yaw_rate_cmd = 2.0 if do_rotate else 0.0
+    if do_rotate:
+        yaw_rate_cmd = YAW_RATE
+    else:
+        yaw_rate_cmd = np.clip(
+            YAW_STIFFNESS * clip_angle(target[3] - sensor_data["yaw"]), -YAW_RATE, YAW_RATE
+        )
     control_command = [vel_cmd[0], vel_cmd[1], g_current_target_height, yaw_rate_cmd]
     return control_command
 
@@ -655,14 +691,15 @@ def create_image(
 
     # Draw attraction/repulsion on drone
     draw_arrows(pos=pos, target=target)
-
-    # Draw attraction/repulsion at mouse position
+    
+    """# Draw attraction/repulsion at mouse position
     offset = np.array([MAP_X_MIN, MAP_Y_MIN])
     mouse_x = min(g_mouse_x, IMG_SIZE_X - 1)
     mouse_y = max(IMG_SIZE_Y - 1 - g_mouse_y, 0)
     mouse_global = np.array([mouse_x, mouse_y]) * IMG_RESOLUTION + offset
     if USE_POTENTIAL_FIELD:
         draw_arrows(pos=mouse_global, target=target)
+    """
 
     return np.flip(img, axis=0)
 
@@ -753,7 +790,12 @@ def path_to_setpoint(path, sensor_data, dt):
             sensor_data["range_down"],
         ]
     if g_on_ground and sensor_data["range_down"] < 0.49:
-        current_setpoint = [g_start_pos[0], g_start_pos[1], g_current_target_height, 0.0]
+        current_setpoint = [
+            g_start_pos[0],
+            g_start_pos[1],
+            g_current_target_height,
+            0.0,
+        ]
         return current_setpoint
     else:
         g_on_ground = False
